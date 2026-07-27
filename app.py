@@ -329,6 +329,28 @@ def calc_paid_leave_grant_days(hire_date_str: str, as_of: date = None) -> int:
     return granted
 
 
+def get_auto_cross_month_night_staff(target_month: str) -> set:
+    """
+    前月がこのシステムで既に自動生成されていれば、前月末日に「入」だった職員を
+    自動的に検出して返す（手動入力不要にするための機能）。
+    前月データが無い場合は空集合を返す（その場合は手動入力にフォールバック）。
+    """
+    year, month = map(int, target_month.split("-"))
+    if month == 1:
+        prev_year, prev_month = year - 1, 12
+    else:
+        prev_year, prev_month = year, month - 1
+    prev_last_day = date(prev_year, prev_month, calendar.monthrange(prev_year, prev_month)[1])
+
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT staff_id FROM generated_shifts WHERE work_date = ? AND shift_code = '入'",
+        (prev_last_day.isoformat(),),
+    ).fetchall()
+    conn.close()
+    return {r[0] for r in rows}
+
+
 def calc_paid_leave_balance(staff_id: int, hire_date_str: str) -> dict:
     """付与日数・消化日数（半休は0.5日として計算）・残日数をまとめて返す"""
     granted = calc_paid_leave_grant_days(hire_date_str)
@@ -344,7 +366,22 @@ def calc_paid_leave_balance(staff_id: int, hire_date_str: str) -> dict:
 # ─────────────────────────────────────────────
 # Streamlit 画面
 # ─────────────────────────────────────────────
-st.set_page_config(page_title="勤務表自動生成システム", layout="wide")
+st.set_page_config(page_title="勤務表自動生成システム", page_icon="🗓️", layout="wide")
+
+# 少しだけ見た目を整えるカスタムCSS（タブを大きめ・見やすく、余白の調整）
+st.markdown("""
+<style>
+    .stTabs [data-baseweb="tab-list"] { gap: 4px; }
+    .stTabs [data-baseweb="tab"] {
+        height: 46px; white-space: pre-wrap; border-radius: 8px 8px 0 0;
+        font-weight: 600; font-size: 14px;
+    }
+    div[data-testid="stExpander"] { border-radius: 10px; border: 1px solid #E0E6E3; }
+    div[data-testid="stMetric"] { background: #F7FAF9; border-radius: 10px; padding: 10px; }
+    h1, h2, h3 { color: #1F3B33; }
+</style>
+""", unsafe_allow_html=True)
+
 init_db()
 seed_sample_staff()
 
@@ -372,7 +409,8 @@ with tabs[0]:
                 f_name = st.text_input("職員名 *")
                 f_job = st.selectbox("職種 *", ["看護師", "介護士"])
                 f_emp = st.selectbox("雇用形態 *", ["常勤", "パート", "扶養内"])
-                f_hire = st.date_input("入社年月日 *", value=date.today())
+                f_hire = st.date_input("入社年月日 *", value=date.today(),
+                                       min_value=date(1950, 1, 1), max_value=date.today())
             with col2:
                 f_limit = None
                 if f_emp in ("パート", "扶養内"):
@@ -419,105 +457,74 @@ with tabs[0]:
     if len(view_df) == 0:
         st.info("該当する職員がいません。")
     else:
-        for _, row in view_df.iterrows():
-            years = calc_years_of_service(row["hire_date"])
-            with st.expander(
-                f"{'🩺' if row['job_type']=='看護師' else '🧑‍⚕️'} {row['name']}"
-                f"　({row['job_type']} / {row['employment_type']} / 勤続{years:.1f}年)"
-                f"{'' if row['active'] else '　🔴退職済'}"
-            ):
-                ec1, ec2 = st.columns(2)
-                with ec1:
-                    e_name = st.text_input("職員名", value=row["name"], key=f"name_{row['id']}")
-                    e_job = st.selectbox("職種", ["看護師", "介護士"],
-                                          index=["看護師", "介護士"].index(row["job_type"]), key=f"job_{row['id']}")
-                    e_emp = st.selectbox("雇用形態", ["常勤", "パート", "扶養内"],
-                                          index=["常勤", "パート", "扶養内"].index(row["employment_type"]), key=f"emp_{row['id']}")
-                    e_hire = st.date_input("入社年月日",
-                                            value=datetime.strptime(row["hire_date"], "%Y-%m-%d").date(),
-                                            key=f"hire_{row['id']}")
-                with ec2:
-                    e_limit = row["monthly_hour_limit"] if row["monthly_hour_limit"] else 80
-                    if e_emp in ("パート", "扶養内"):
-                        e_limit = st.number_input("月間労働時間上限（時間）", min_value=1, max_value=200,
-                                                    value=int(e_limit), key=f"limit_{row['id']}")
-                    else:
-                        e_limit = None
-                        st.caption("常勤のため時間上限なし")
-                    e_night_ok = st.checkbox("夜勤可能", value=bool(row["night_shift_ok"]), key=f"nok_{row['id']}")
-                    e_night_target = st.number_input("月間目標夜勤回数", min_value=0, max_value=15,
-                                                       value=int(row["night_shift_target"] or 0), key=f"ntgt_{row['id']}")
-                    e_am_pm = st.checkbox("午前(am)・午後(pm)勤務に対応できる",
-                                           value=bool(row["am_pm_eligible"]) if "am_pm_eligible" in row.index else False,
-                                           key=f"ampm_{row['id']}")
-                    e_active = st.checkbox("在籍中", value=bool(row["active"]), key=f"active_{row['id']}")
-                e_note = st.text_input("備考", value=row["note"] or "", key=f"note_{row['id']}")
+        # 「看護師 常勤」「看護師 パート」「介護士 常勤」「介護士 パート」のようにグループ化して表示
+        group_order = [
+            ("看護師", "常勤"), ("看護師", "パート"), ("看護師", "扶養内"),
+            ("介護士", "常勤"), ("介護士", "パート"), ("介護士", "扶養内"),
+        ]
+        for job_type, emp_type in group_order:
+            group_df = view_df[(view_df["job_type"] == job_type) & (view_df["employment_type"] == emp_type)]
+            if len(group_df) == 0:
+                continue
+            st.markdown(f"#### {'🩺' if job_type == '看護師' else '🧑‍⚕️'} {job_type}　{emp_type}　（{len(group_df)}名）")
+            for _, row in group_df.iterrows():
+                years = calc_years_of_service(row["hire_date"])
+                with st.expander(
+                    f"{'🩺' if row['job_type']=='看護師' else '🧑‍⚕️'} {row['name']}"
+                    f"　({row['job_type']} / {row['employment_type']} / 勤続{years:.1f}年)"
+                    f"{'' if row['active'] else '　🔴退職済'}"
+                ):
+                    ec1, ec2 = st.columns(2)
+                    with ec1:
+                        e_name = st.text_input("職員名", value=row["name"], key=f"name_{row['id']}")
+                        e_job = st.selectbox("職種", ["看護師", "介護士"],
+                                              index=["看護師", "介護士"].index(row["job_type"]), key=f"job_{row['id']}")
+                        e_emp = st.selectbox("雇用形態", ["常勤", "パート", "扶養内"],
+                                              index=["常勤", "パート", "扶養内"].index(row["employment_type"]), key=f"emp_{row['id']}")
+                        e_hire = st.date_input("入社年月日",
+                                                value=datetime.strptime(row["hire_date"], "%Y-%m-%d").date(),
+                                                min_value=date(1950, 1, 1), max_value=date.today(),
+                                                key=f"hire_{row['id']}")
+                    with ec2:
+                        e_limit = row["monthly_hour_limit"] if row["monthly_hour_limit"] else 80
+                        if e_emp in ("パート", "扶養内"):
+                            e_limit = st.number_input("月間労働時間上限（時間）", min_value=1, max_value=200,
+                                                        value=int(e_limit), key=f"limit_{row['id']}")
+                        else:
+                            e_limit = None
+                            st.caption("常勤のため時間上限なし")
+                        e_night_ok = st.checkbox("夜勤可能", value=bool(row["night_shift_ok"]), key=f"nok_{row['id']}")
+                        e_night_target = st.number_input("月間目標夜勤回数", min_value=0, max_value=15,
+                                                           value=int(row["night_shift_target"] or 0), key=f"ntgt_{row['id']}")
+                        e_am_pm = st.checkbox("午前(am)・午後(pm)勤務に対応できる",
+                                               value=bool(row["am_pm_eligible"]) if "am_pm_eligible" in row.index else False,
+                                               key=f"ampm_{row['id']}")
+                        e_active = st.checkbox("在籍中", value=bool(row["active"]), key=f"active_{row['id']}")
+                    e_note = st.text_input("備考", value=row["note"] or "", key=f"note_{row['id']}")
 
-                bcol1, bcol2 = st.columns([1, 1])
-                with bcol1:
-                    if st.button("💾 更新を保存", key=f"save_{row['id']}"):
-                        conn = get_conn()
-                        conn.execute(
-                            """UPDATE staff SET name=?, job_type=?, employment_type=?, monthly_hour_limit=?,
-                               night_shift_ok=?, night_shift_target=?, am_pm_eligible=?, hire_date=?, active=?, note=?
-                               WHERE id=?""",
-                            (e_name, e_job, e_emp, e_limit, int(e_night_ok), e_night_target, int(e_am_pm),
-                             e_hire.isoformat(), int(e_active), e_note, row["id"]),
-                        )
-                        conn.commit()
-                        conn.close()
-                        st.success("更新しました。")
-                        st.rerun()
-                with bcol2:
-                    if st.button("🗑️ この職員を削除", key=f"del_{row['id']}"):
-                        conn = get_conn()
-                        conn.execute("DELETE FROM staff WHERE id=?", (row["id"],))
-                        conn.commit()
-                        conn.close()
-                        st.warning(f"{row['name']} さんを削除しました。")
-                        st.rerun()
-
-                # ── この職員の希望休み・希望勤務の登録 ──
-                st.markdown("**📌 シフト希望（希望休み・希望勤務・有給希望）**")
-                wc1, wc2, wc3 = st.columns(3)
-                with wc1:
-                    w_month = st.text_input("対象月 (YYYY-MM)", value=date.today().strftime("%Y-%m"),
-                                             key=f"wmonth_{row['id']}")
-                with wc2:
-                    w_date = st.date_input("希望日", value=date.today(), key=f"wdate_{row['id']}")
-                with wc3:
-                    # 「明」は夜勤入りに自動連動するため、手動での希望対象からは除外する
-                    requestable_codes = [s[0] for s in DEFAULT_SHIFT_TYPES if s[0] != "明"]
-                    w_shift_code = st.selectbox("希望するコード", requestable_codes, key=f"wshift_{row['id']}",
-                                                 help="×=休み希望、年/年am/年pm=有給希望（全休/午前半休/午後半休）、"
-                                                      "N・準・入・am・pm=勤務希望、出/実/研/産/育=特別区分の希望")
-                if st.button("この希望を追加", key=f"waddbtn_{row['id']}"):
-                    conn = get_conn()
-                    conn.execute(
-                        """INSERT INTO staff_constraints (staff_id, target_month, constraint_date,
-                           constraint_type, shift_code, memo) VALUES (?,?,?,?,?,?)""",
-                        (row["id"], w_month, w_date.isoformat(), "希望", w_shift_code, ""),
-                    )
-                    conn.commit()
-                    conn.close()
-                    st.success("希望を登録しました。")
-                    st.rerun()
-
-                conn = get_conn()
-                cons_df = pd.read_sql_query(
-                    "SELECT id, target_month, constraint_date, constraint_type, shift_code FROM staff_constraints WHERE staff_id=? ORDER BY constraint_date",
-                    conn, params=(row["id"],),
-                )
-                conn.close()
-                if len(cons_df):
-                    st.dataframe(cons_df, use_container_width=True, hide_index=True)
-                    del_id = st.selectbox("削除する希望のID", [0] + cons_df["id"].tolist(), key=f"delcons_{row['id']}")
-                    if del_id and st.button("選択した希望を削除", key=f"delconsbtn_{row['id']}"):
-                        conn = get_conn()
-                        conn.execute("DELETE FROM staff_constraints WHERE id=?", (del_id,))
-                        conn.commit()
-                        conn.close()
-                        st.rerun()
+                    bcol1, bcol2 = st.columns([1, 1])
+                    with bcol1:
+                        if st.button("💾 更新を保存", key=f"save_{row['id']}"):
+                            conn = get_conn()
+                            conn.execute(
+                                """UPDATE staff SET name=?, job_type=?, employment_type=?, monthly_hour_limit=?,
+                                   night_shift_ok=?, night_shift_target=?, am_pm_eligible=?, hire_date=?, active=?, note=?
+                                   WHERE id=?""",
+                                (e_name, e_job, e_emp, e_limit, int(e_night_ok), e_night_target, int(e_am_pm),
+                                 e_hire.isoformat(), int(e_active), e_note, row["id"]),
+                            )
+                            conn.commit()
+                            conn.close()
+                            st.success("更新しました。")
+                            st.rerun()
+                    with bcol2:
+                        if st.button("🗑️ この職員を削除", key=f"del_{row['id']}"):
+                            conn = get_conn()
+                            conn.execute("DELETE FROM staff WHERE id=?", (row["id"],))
+                            conn.commit()
+                            conn.close()
+                            st.warning(f"{row['name']} さんを削除しました。")
+                            st.rerun()
 
 # ═════════════════════════════════════════════
 # TAB (新設): 希望シフト一括入力（カレンダー形式）
@@ -583,14 +590,24 @@ with tabs[1]:
                 grid_df.at[id_to_row[sid], col] = erow["shift_code"] or ""
 
             st.markdown(
-                "**入力できるコード**：× (休み希望) ／ 年・年am・年pm (有給希望：全休/午前半休/午後半休) ／ "
-                "N・準・入・am・pm (勤務希望) ／ 出・実・研・産・育 (特別区分の希望) ／ 空欄 (希望なし)"
+                "**日付のセルをタップすると、希望コードを選べます。**　"
+                "×=休み希望／年・年am・年pm=有給希望（全休/午前半休/午後半休）／"
+                "N・準・入・am・pm=勤務希望／出・実・研・産・育=特別区分の希望／空欄=希望なし"
             )
+            requestable_codes = [""] + [s[0] for s in DEFAULT_SHIFT_TYPES if s[0] != "明"]
+            column_config = {
+                "職員名": st.column_config.TextColumn("職員名", disabled=True),
+            }
+            for col in date_cols:
+                column_config[col] = st.column_config.SelectboxColumn(
+                    col, options=requestable_codes, required=False, width="small",
+                )
             edited_grid = st.data_editor(
                 grid_df,
                 use_container_width=True,
                 height=min(70 + 35 * len(staff_df), 700),
                 disabled=["職員名"],
+                column_config=column_config,
                 key="shift_request_grid",
             )
 
@@ -893,9 +910,14 @@ with tabs[3]:
 
     # ── 月またぎ夜勤 ──
     with sub_tab4:
+        st.success(
+            "✅ **前月分をこのシステムで自動生成していれば、この入力は基本的に不要です。**\n\n"
+            "前月末日に「入（夜勤入り）」だった職員は、シフト自動生成のたびに自動で検出され、"
+            "当月1日目の生成に反映されます。"
+        )
         st.caption(
-            "労基法上、夜勤のような日をまたぐ勤務は「始業時刻が属する日の勤務」として1回の連続勤務でカウントします。"
-            "前月末日が夜勤だった職員がいる場合、当月の生成に反映するためここに入力してください。"
+            "以下の入力は、前月を紙の勤務表など別の方法で管理していた場合や、"
+            "自動検出の結果を上書きしたい場合のみお使いください。"
         )
         conn = get_conn()
         staff_df = pd.read_sql_query("SELECT id, name FROM staff WHERE active=1 AND night_shift_ok=1 ORDER BY name", conn)
@@ -1131,8 +1153,11 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
             penalty_terms.append((NIGHT_REST_WEIGHT, aux))
 
     # ── ソフト③: 月またぎ夜勤の翌日も明けを強く推奨（絶対ではない） ──
-    for _, crow in cross_df.iterrows():
-        s = crow["staff_id"]
+    # 前月がこのシステムで生成済みなら自動検出、無ければ手動入力（cross_month_night）で補う
+    auto_cross_staff = get_auto_cross_month_night_staff(target_month)
+    manual_cross_staff = {int(crow["staff_id"]) for _, crow in cross_df.iterrows()}
+    all_cross_staff = auto_cross_staff | manual_cross_staff
+    for s in all_cross_staff:
         if s not in staff_ids or (s, 0) in request_map:
             continue
         aux = model.NewBoolVar(f"crossrest_aux_{s}")
@@ -1200,6 +1225,29 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
         result_rows.append(row)
     result_df = pd.DataFrame(result_rows)
 
+    # ── 日別の集計行を末尾に追加する ──
+    date_col_names = [f"{date_list[d].day}日({WEEKDAY_JP[date_list[d].weekday()]})" for d in range(n_days)]
+    summary_defs = [
+        ("日勤 看護師", "N", "看護師"), ("日勤 介護士", "N", "介護士"),
+        ("夜勤入り 看護師", "入", "看護師"), ("夜勤明け 看護師", "明", "看護師"),
+        ("夜勤入り 介護士", "入", "介護士"), ("夜勤明け 介護士", "明", "介護士"),
+        ("休み", "×", None),
+    ]
+    summary_rows = []
+    for label, target_code, target_job in summary_defs:
+        srow = {"職員名": f"【集計】{label}", "職種": ""}
+        for d in range(n_days):
+            cnt = 0
+            for s in staff_ids:
+                if assigned_map.get((s, d)) != target_code:
+                    continue
+                if target_job is not None and job_map[s] != target_job:
+                    continue
+                cnt += 1
+            srow[date_col_names[d]] = cnt
+        summary_rows.append(srow)
+    result_df = pd.concat([result_df, pd.DataFrame(summary_rows)], ignore_index=True)
+
     # ── 「ご相談」判定: 個人希望と実際の割り当てが食い違った箇所を洗い出す ──
     consult_list = []
     for (s, d_index), req_code in request_map.items():
@@ -1244,26 +1292,34 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
     return True, status_msg, result_df, consult_list
 
 def build_excel_export(result_df: pd.DataFrame, target_month: str) -> bytes:
-    """シフト結果を、集計列付きのExcelバイト列として返す"""
+    """シフト結果を、集計列付きのExcelバイト列として返す（末尾の日別集計行は個人集計の対象外にする）"""
     conn = get_conn()
     hours_map = {row["code"]: row["hours"] for _, row in pd.read_sql_query("SELECT * FROM shift_types", conn).iterrows()}
     conn.close()
 
     day_cols = [c for c in result_df.columns if c not in ("職員名", "職種")]
 
-    export_df = result_df.copy()
+    is_summary_row = result_df["職員名"].astype(str).str.startswith("【集計】")
+    staff_only_df = result_df[~is_summary_row].copy()
+    summary_only_df = result_df[is_summary_row].copy()
+
     day_counts, night_counts, paid_counts, total_hours = [], [], [], []
-    for _, row in export_df.iterrows():
+    for _, row in staff_only_df.iterrows():
         codes = [row[c] for c in day_cols]
         day_counts.append(sum(1 for c in codes if c == "N"))
         night_counts.append(sum(1 for c in codes if c == "入"))
         paid_counts.append(sum(1 for c in codes if c == "年") + sum(0.5 for c in codes if c in ("年am", "年pm")))
         total_hours.append(round(sum(hours_map.get(c, 0) for c in codes), 1))
 
-    export_df["日勤回数"] = day_counts
-    export_df["夜勤回数"] = night_counts
-    export_df["有休回数"] = paid_counts
-    export_df["合計労働時間"] = total_hours
+    staff_only_df["日勤回数"] = day_counts
+    staff_only_df["夜勤回数"] = night_counts
+    staff_only_df["有休回数"] = paid_counts
+    staff_only_df["合計労働時間"] = total_hours
+
+    # 集計行は、集計列を空欄のまま末尾に追加する
+    for col in ["日勤回数", "夜勤回数", "有休回数", "合計労働時間"]:
+        summary_only_df[col] = ""
+    export_df = pd.concat([staff_only_df, summary_only_df], ignore_index=True)
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
