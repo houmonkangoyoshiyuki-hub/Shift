@@ -486,7 +486,7 @@ with tabs[0]:
                                                 min_value=date(1950, 1, 1), max_value=date.today(),
                                                 key=f"hire_{row['id']}")
                     with ec2:
-                        e_limit = row["monthly_hour_limit"] if row["monthly_hour_limit"] else 80
+                        e_limit = row["monthly_hour_limit"] if pd.notna(row["monthly_hour_limit"]) and row["monthly_hour_limit"] else 80
                         if e_emp in ("パート", "扶養内"):
                             e_limit = st.number_input("月間労働時間上限（時間）", min_value=1, max_value=200,
                                                         value=int(e_limit), key=f"limit_{row['id']}")
@@ -560,91 +560,158 @@ with tabs[1]:
                 wd = date(g_year, g_month, d).weekday()
                 date_cols.append(f"{d}({WEEKDAY_JP[wd]})")
 
-            # 既存の登録済み希望を読み込んで初期表示に反映する
-            conn = get_conn()
-            existing = pd.read_sql_query(
-                "SELECT * FROM staff_constraints WHERE target_month=?", conn, params=(grid_month,)
-            )
-            conn.close()
+            # 職員名で絞り込み（対象の職員をすぐ見つけられるように）
+            search_name = st.text_input("🔍 職員名で絞り込み（下にスクロールしなくても見つけやすくなります）", value="")
+            filtered_staff_df = staff_df[staff_df["name"].str.contains(search_name, na=False)] if search_name else staff_df
 
-            grid_data = {"職員名": staff_df["name"].tolist()}
-            for col in date_cols:
-                grid_data[col] = ["" for _ in range(len(staff_df))]
-
-            grid_df = pd.DataFrame(grid_data)
-
-            # 既存データをグリッドに反映
-            id_to_row = {sid: i for i, sid in enumerate(staff_df["id"].tolist())}
-            for _, erow in existing.iterrows():
-                sid = erow["staff_id"]
-                if sid not in id_to_row:
-                    continue
-                try:
-                    d_num = int(erow["constraint_date"].split("-")[2])
-                except Exception:
-                    continue
-                col_match = [c for c in date_cols if c.startswith(f"{d_num}(")]
-                if not col_match:
-                    continue
-                col = col_match[0]
-                grid_df.at[id_to_row[sid], col] = erow["shift_code"] or ""
-
-            st.markdown(
-                "**日付のセルをタップすると、希望コードを選べます。**　"
-                "×=休み希望／年・年am・年pm=有給希望（全休/午前半休/午後半休）／"
-                "N・準・入・明・am・pm=勤務希望／出・実・研・産・育=特別区分の希望／空欄=希望なし"
-            )
-            requestable_codes = [""] + [s[0] for s in DEFAULT_SHIFT_TYPES]
-            column_config = {
-                "職員名": st.column_config.TextColumn("職員名", disabled=True),
-            }
-            for col in date_cols:
-                column_config[col] = st.column_config.SelectboxColumn(
-                    col, options=requestable_codes, required=False, width="small",
-                )
-            edited_grid = st.data_editor(
-                grid_df,
-                use_container_width=True,
-                height=min(70 + 35 * len(staff_df), 700),
-                disabled=["職員名"],
-                column_config=column_config,
-                key="shift_request_grid",
-            )
-
-            if st.button("💾 このカレンダーの内容を保存する", type="primary"):
-                valid_codes = {s[0] for s in DEFAULT_SHIFT_TYPES}
-                name_to_id = dict(zip(staff_df["name"], staff_df["id"]))
-
+            if len(filtered_staff_df) == 0:
+                st.warning("該当する職員が見つかりませんでした。")
+            else:
+                # 既存の登録済み希望を読み込んで初期表示に反映する
                 conn = get_conn()
-                # 当月分の既存の希望をいったん全削除してから、グリッドの内容で作り直す
-                staff_id_list = staff_df["id"].tolist()
-                conn.execute(
-                    f"DELETE FROM staff_constraints WHERE target_month=? AND staff_id IN ({','.join('?' * len(staff_id_list))})",
-                    [grid_month] + staff_id_list,
+                existing = pd.read_sql_query(
+                    "SELECT * FROM staff_constraints WHERE target_month=?", conn, params=(grid_month,)
                 )
+                conn.close()
 
-                inserted = 0
-                for _, grow in edited_grid.iterrows():
-                    sid = name_to_id.get(grow["職員名"])
-                    if sid is None:
+                grid_data = {"職員名": filtered_staff_df["name"].tolist()}
+                for col in date_cols:
+                    grid_data[col] = ["" for _ in range(len(filtered_staff_df))]
+
+                # 職員名をインデックスにすると、横にスクロールしても左端に固定表示される
+                grid_df = pd.DataFrame(grid_data).set_index("職員名")
+
+                # 既存データをグリッドに反映
+                id_to_name = dict(zip(filtered_staff_df["id"], filtered_staff_df["name"]))
+                for _, erow in existing.iterrows():
+                    sid = erow["staff_id"]
+                    if sid not in id_to_name:
                         continue
-                    for col in date_cols:
-                        val = str(grow[col]).strip()
-                        if not val or val == "nan":
+                    try:
+                        d_num = int(erow["constraint_date"].split("-")[2])
+                    except Exception:
+                        continue
+                    col_match = [c for c in date_cols if c.startswith(f"{d_num}(")]
+                    if not col_match:
+                        continue
+                    col = col_match[0]
+                    grid_df.at[id_to_name[sid], col] = erow["shift_code"] or ""
+
+                st.markdown(
+                    "**日付のセルをタップすると、希望コードを選べます。**　"
+                    "×=休み希望／年・年am・年pm=有給希望（全休/午前半休/午後半休）／"
+                    "N・準・入・明・am・pm=勤務希望／出・実・研・産・育=特別区分の希望／空欄=希望なし"
+                )
+                lock_edit = st.checkbox(
+                    "🔒 入力が終わったので編集をロックする（誤って他の人の欄を押してしまう事故を防げます）",
+                    value=False, key=f"lock_{grid_month}",
+                )
+                requestable_codes = [""] + [s[0] for s in DEFAULT_SHIFT_TYPES]
+                column_config = {}
+                for col in date_cols:
+                    column_config[col] = st.column_config.SelectboxColumn(
+                        col, options=requestable_codes, required=False, width="small",
+                    )
+                edited_grid = st.data_editor(
+                    grid_df,
+                    use_container_width=True,
+                    height=min(70 + 35 * len(filtered_staff_df), 700),
+                    disabled=lock_edit,
+                    column_config=column_config,
+                    key=f"shift_request_grid_{grid_month}",
+                )
+                if lock_edit:
+                    st.info("🔒 現在ロック中です。編集するには、上のチェックを外してください。")
+
+                if st.button("💾 このカレンダーの内容を保存する", type="primary", disabled=lock_edit):
+                    valid_codes = {s[0] for s in DEFAULT_SHIFT_TYPES}
+                    name_to_id = dict(zip(filtered_staff_df["name"], filtered_staff_df["id"]))
+
+                    conn = get_conn()
+                    # 絞り込み表示中の職員分だけを対象に、当月分の既存の希望を一旦削除してから作り直す
+                    staff_id_list = filtered_staff_df["id"].tolist()
+                    conn.execute(
+                        f"DELETE FROM staff_constraints WHERE target_month=? AND staff_id IN ({','.join('?' * len(staff_id_list))})",
+                        [grid_month] + staff_id_list,
+                    )
+
+                    inserted = 0
+                    for staff_name, grow in edited_grid.iterrows():
+                        sid = name_to_id.get(staff_name)
+                        if sid is None:
                             continue
-                        if val not in valid_codes:
-                            continue  # 誤入力防止のため、無効なコードは保存されません
-                        d_num = int(col.split("(")[0])
-                        c_date = date(g_year, g_month, d_num).isoformat()
-                        conn.execute(
-                            """INSERT INTO staff_constraints (staff_id, target_month, constraint_date,
-                               constraint_type, shift_code, memo) VALUES (?,?,?,?,?,?)""",
-                            (sid, grid_month, c_date, "希望", val, ""),
-                        )
-                        inserted += 1
+                        for col in date_cols:
+                            val = str(grow[col]).strip()
+                            if not val or val == "nan":
+                                continue
+                            if val not in valid_codes:
+                                continue  # 誤入力防止のため、無効なコードは保存されません
+                            d_num = int(col.split("(")[0])
+                            c_date = date(g_year, g_month, d_num).isoformat()
+                            conn.execute(
+                                """INSERT INTO staff_constraints (staff_id, target_month, constraint_date,
+                                   constraint_type, shift_code, memo) VALUES (?,?,?,?,?,?)""",
+                                (sid, grid_month, c_date, "希望", val, ""),
+                            )
+                            inserted += 1
+                    conn.commit()
+                    conn.close()
+                    st.success(f"{inserted}件の希望を保存しました。")
+                    st.rerun()
+
+    st.divider()
+    st.markdown("### 📆 期間で一括登録（産休・育休・出張・実習・研修など）")
+    st.caption(
+        "「◯月◯日から◯月◯日まで、ずっと育休」のような、まとまった期間の登録に便利です。"
+        "上のカレンダーに1日ずつ入力する必要はありません。"
+    )
+    conn = get_conn()
+    all_staff_df = pd.read_sql_query("SELECT id, name FROM staff WHERE active=1 ORDER BY name", conn)
+    conn.close()
+    if len(all_staff_df):
+        bc1, bc2 = st.columns(2)
+        with bc1:
+            b_staff = st.selectbox("職員", all_staff_df["name"].tolist(), key="bulk_staff")
+        with bc2:
+            b_code = st.selectbox(
+                "登録する内容", ["産", "育", "出", "実", "研", "年", "×"],
+                format_func=lambda x: {"産": "産休", "育": "育休", "出": "出張", "実": "実習",
+                                        "研": "研修", "年": "年休（連続取得）", "×": "休み（連続）"}[x],
+                key="bulk_code",
+            )
+        bc3, bc4 = st.columns(2)
+        with bc3:
+            b_start = st.date_input("開始日", value=date.today(), key="bulk_start")
+        with bc4:
+            b_end = st.date_input("終了日", value=date.today(), key="bulk_end")
+
+        if b_end < b_start:
+            st.error("終了日は開始日以降にしてください。")
+        else:
+            days_count = (b_end - b_start).days + 1
+            st.caption(f"対象期間: {days_count}日間")
+            if st.button("この期間で一括登録する", type="primary"):
+                staff_id = int(all_staff_df[all_staff_df["name"] == b_staff]["id"].iloc[0])
+                conn = get_conn()
+                inserted = 0
+                cur_date = b_start
+                while cur_date <= b_end:
+                    ym = cur_date.strftime("%Y-%m")
+                    # 同じ日・同じ職員の既存の希望があれば削除してから登録し直す（上書き）
+                    conn.execute(
+                        "DELETE FROM staff_constraints WHERE staff_id=? AND constraint_date=?",
+                        (staff_id, cur_date.isoformat()),
+                    )
+                    conn.execute(
+                        """INSERT INTO staff_constraints (staff_id, target_month, constraint_date,
+                           constraint_type, shift_code, memo) VALUES (?,?,?,?,?,?)""",
+                        (staff_id, ym, cur_date.isoformat(), "希望", b_code, ""),
+                    )
+                    inserted += 1
+                    cur_date += timedelta(days=1)
                 conn.commit()
                 conn.close()
-                st.success(f"{inserted}件の希望を保存しました。")
+                st.success(f"{b_staff} さんに、{b_start}〜{b_end}（{inserted}日間）の登録をしました。")
                 st.rerun()
 
 # ═════════════════════════════════════════════
@@ -1064,7 +1131,7 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
     conn.close()
     for _, srow in staff_df.iterrows():
         s = srow["id"]
-        if srow["monthly_hour_limit"]:
+        if pd.notna(srow["monthly_hour_limit"]) and srow["monthly_hour_limit"]:
             total_minutes = []
             for d in range(n_days):
                 for code in work_codes:
