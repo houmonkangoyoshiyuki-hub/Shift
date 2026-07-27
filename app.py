@@ -224,24 +224,18 @@ def init_db():
             )
         conn.commit()
 
-    # 曜日別必要人数の初期データ投入（全曜日: 日勤 看護師2/介護士3、夜勤(入)は別テーブルで管理）
+    # 曜日別の最低人数指定：初期値は基本0（=システムにお任せ）。
+    # 入浴日（火木土）だけ「最低限必要な理由がある」例として最小限を入れておく。
     c.execute("SELECT COUNT(*) FROM staffing_requirements")
     if c.fetchone()[0] == 0:
-        default_req = {
-            "N": {"看護師": 2, "介護士": 3},
-            "準": {"看護師": 1, "介護士": 1},  # 3交代制で使用。2交代制の施設では0にしてお使いください
-            "am": {"看護師": 0, "介護士": 1},  # am/pm対応可の職員のみが割り当て対象になります
-            "pm": {"看護師": 0, "介護士": 1},
-        }
         for weekday in range(7):
-            for shift_code, jobs in default_req.items():
-                for job_type, cnt in jobs.items():
-                    # 入浴日は火・木・土を初期値としておく（施設ごとに変更可能）
+            for shift_code in ["N", "準", "am", "pm"]:
+                for job_type in ["看護師", "介護士"]:
                     is_bath = 1 if weekday in (1, 3, 5) and shift_code == "N" else 0
-                    extra = 1 if is_bath and job_type == "介護士" else 0
+                    cnt = 1 if (is_bath and job_type == "介護士") else 0  # 入浴日の日勤介護士のみ例として最低1名
                     c.execute(
                         "INSERT OR IGNORE INTO staffing_requirements (weekday, shift_code, job_type, required_count, is_bath_day) VALUES (?,?,?,?,?)",
-                        (weekday, shift_code, job_type, cnt + extra, is_bath),
+                        (weekday, shift_code, job_type, cnt, is_bath),
                     )
         conn.commit()
 
@@ -841,7 +835,7 @@ with tabs[3]:
     st.subheader("⚙️ シフト区分・必要人数・夜勤ルールの設定")
 
     sub_tab1, sub_tab2, sub_tab3, sub_tab4 = st.tabs(
-        ["🕐 シフト区分", "📅 曜日別必要人数", "🌙 夜勤の配置ルール", "🔀 月またぎ夜勤"]
+        ["🕐 シフト区分", "📅 曜日別の最低人数指定", "🌙 夜勤の配置ルール", "🔀 月またぎ夜勤"]
     )
 
     # ── シフト区分 ──
@@ -876,12 +870,15 @@ with tabs[3]:
                 st.success("更新しました。")
                 st.rerun()
 
-    # ── 曜日別必要人数 ──
+    # ── 曜日別の最低人数指定 ──
     with sub_tab2:
-        st.caption(
-            "曜日ごと・シフト区分ごとに必要な人数を設定します。「入浴日」等、特定曜日で人数が増える場合は"
-            "「特別対応日」にチェックを入れてください（介護士+1名など、施設の実情に合わせて数値を調整してください）。"
+        st.info(
+            "💡 **「0」＝最低人数の指定なし（システムにお任せ）**\n\n"
+            "例：月曜は入浴介助があるので、最低でも介護士2名は欲しい → その日だけ「2」を指定。"
+            "特に理由がない曜日・シフトは「0」のままでOKです。指定しなかった分は、他の制約"
+            "（週1休み・希望など）を守りつつ、システムが自動でバランス良く配置します。"
         )
+        st.caption("「特別対応日」にチェックを入れると、入浴日など特別な日として記録に残せます（任意）。")
         conn = get_conn()
         req_df = pd.read_sql_query(
             "SELECT * FROM staffing_requirements ORDER BY weekday, shift_code, job_type", conn
