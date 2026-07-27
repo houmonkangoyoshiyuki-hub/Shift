@@ -35,16 +35,31 @@ DB_PATH = "shift_app.db"
 # シフト区分の初期定義（設定タブから編集可能）
 # ─────────────────────────────────────────────
 DEFAULT_SHIFT_TYPES = [
-    # code, name, start, end, hours, is_night(夜勤扱いか)
-    ("D",  "日勤",   "08:30", "17:30", 8.0, False),
-    ("N1", "準夜勤", "16:30", "01:00", 8.0, True),
-    ("N2", "深夜勤", "00:30", "09:00", 8.0, True),
-    ("E",  "早出",   "07:00", "16:00", 8.0, False),
-    ("AM", "午前勤務", "08:30", "12:30", 4.0, False),
-    ("PM", "午後勤務", "13:30", "17:30", 4.0, False),
-    ("休", "休み",   "", "", 0.0, False),
-    ("有", "有給",   "", "", 0.0, False),
+    # code, name, start, end, hours, is_night(夜勤入り扱いか), leave_amount(有給消費日数、勤務系は0)
+    ("N",   "日勤",       "08:30", "17:30", 8.0,  False, 0),
+    ("準",  "準夜勤",     "16:30", "01:00", 8.0,  False, 0),
+    ("入",  "夜勤入り",   "16:30", "09:00", 16.0, True,  0),
+    ("明",  "明け",       "", "", 0.0, False, 0),
+    ("am",  "午前勤務",   "08:30", "12:30", 4.0, False, 0),
+    ("pm",  "午後勤務",   "13:30", "17:30", 4.0, False, 0),
+    ("×",   "休み",       "", "", 0.0, False, 0),
+    ("年",  "年休（全休）", "", "", 0.0, False, 1.0),
+    ("年am", "年休（午前半休）", "", "", 4.0, False, 0.5),
+    ("年pm", "年休（午後半休）", "", "", 4.0, False, 0.5),
+    # 以下は希望があった場合のみ使う特別区分（必要人数の対象外、希望があれば100%反映）
+    ("出",  "出張",       "", "", 0.0, False, 0),
+    ("実",  "実習",       "", "", 0.0, False, 0),
+    ("研",  "研修",       "", "", 0.0, False, 0),
+    ("産",  "産休",       "", "", 0.0, False, 0),
+    ("育",  "育休",       "", "", 0.0, False, 0),
 ]
+
+# 必要人数の設定・自動生成の対象となる「通常勤務」コード（特別区分は含まない）
+STANDARD_WORK_CODES = ["N", "準", "入", "am", "pm"]
+# 希望があれば使う特別区分（自動生成では必要人数の対象にせず、希望があれば必ず反映する）
+SPECIAL_CODES = ["出", "実", "研", "産", "育"]
+# 有給・半休系
+LEAVE_CODES = ["年", "年am", "年pm"]
 
 WEEKDAY_JP = ["月", "火", "水", "木", "金", "土", "日"]
 
@@ -72,11 +87,18 @@ def init_db():
             monthly_hour_limit INTEGER,       -- パート等の月間労働時間上限（常勤はNULL）
             night_shift_ok INTEGER NOT NULL DEFAULT 1,  -- 1=可, 0=不可
             night_shift_target INTEGER DEFAULT 4,       -- 月間目標夜勤回数
+            am_pm_eligible INTEGER NOT NULL DEFAULT 0,  -- 午前(am)/午後(pm)勤務に対応できるか（1=可）
             hire_date TEXT NOT NULL,          -- 入社年月日 YYYY-MM-DD
             active INTEGER NOT NULL DEFAULT 1,
             note TEXT
         )
     """)
+
+    # 簡易マイグレーション: 旧バージョンのDBにam_pm_eligibleが無い場合は追加
+    existing_staff_cols = [row[1] for row in c.execute("PRAGMA table_info(staff)").fetchall()]
+    if "am_pm_eligible" not in existing_staff_cols:
+        c.execute("ALTER TABLE staff ADD COLUMN am_pm_eligible INTEGER NOT NULL DEFAULT 0")
+    conn.commit()
 
     # 職員ごとのシフト制約（希望休み・希望勤務・時間縛り等）月単位で管理
     c.execute("""
@@ -85,7 +107,7 @@ def init_db():
             staff_id INTEGER NOT NULL,
             target_month TEXT NOT NULL,   -- YYYY-MM
             constraint_date TEXT NOT NULL, -- YYYY-MM-DD
-            constraint_type TEXT NOT NULL, -- 希望休み / 希望勤務 / 有給希望
+            constraint_type TEXT NOT NULL, -- 常に"希望"（shift_codeに実際の希望コードを直接格納するシンプル設計）
             shift_code TEXT,               -- 希望勤務の場合のシフトコード
             memo TEXT,
             FOREIGN KEY (staff_id) REFERENCES staff(id) ON DELETE CASCADE
@@ -98,10 +120,20 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             staff_id INTEGER NOT NULL,
             used_date TEXT NOT NULL,   -- YYYY-MM-DD
+            amount REAL NOT NULL DEFAULT 1.0,  -- 消費日数（1.0=全休, 0.5=半休）
+            source TEXT NOT NULL DEFAULT '手動',  -- '自動'（シフト生成時に自動記録）/ '手動'（人力で登録・修正）
             note TEXT,
             FOREIGN KEY (staff_id) REFERENCES staff(id) ON DELETE CASCADE
         )
     """)
+
+    # 簡易マイグレーション: 旧バージョンのDBにamount/sourceが無い場合は追加
+    existing_leave_cols = [row[1] for row in c.execute("PRAGMA table_info(paid_leave_usage)").fetchall()]
+    if "amount" not in existing_leave_cols:
+        c.execute("ALTER TABLE paid_leave_usage ADD COLUMN amount REAL NOT NULL DEFAULT 1.0")
+    if "source" not in existing_leave_cols:
+        c.execute("ALTER TABLE paid_leave_usage ADD COLUMN source TEXT NOT NULL DEFAULT '手動'")
+    conn.commit()
 
     # シフト区分マスター
     c.execute("""
@@ -111,9 +143,16 @@ def init_db():
             start_time TEXT,
             end_time TEXT,
             hours REAL NOT NULL,
-            is_night INTEGER NOT NULL DEFAULT 0
+            is_night INTEGER NOT NULL DEFAULT 0,
+            leave_amount REAL NOT NULL DEFAULT 0   -- 有給としての消費日数（1.0=全休, 0.5=半休, 0=通常勤務や休み）
         )
     """)
+
+    # 簡易マイグレーション: 旧バージョンのDBにleave_amountが無い場合は追加
+    existing_shift_cols = [row[1] for row in c.execute("PRAGMA table_info(shift_types)").fetchall()]
+    if "leave_amount" not in existing_shift_cols:
+        c.execute("ALTER TABLE shift_types ADD COLUMN leave_amount REAL NOT NULL DEFAULT 0")
+    conn.commit()
 
     # 曜日別・シフト種別ごとの必要人数設定（職種別）
     c.execute("""
@@ -137,10 +176,17 @@ def init_db():
             allow_flex INTEGER NOT NULL DEFAULT 1,   -- 介護士不足時、看護師で補填してよいか
             flex_nurse INTEGER NOT NULL DEFAULT 2,
             flex_care INTEGER NOT NULL DEFAULT 1,
-            max_consecutive_days INTEGER NOT NULL DEFAULT 4  -- 施設運用ルール（法律の絶対上限ではない）
+            max_consecutive_days INTEGER NOT NULL DEFAULT 4,  -- 施設運用ルール（法律の絶対上限ではない）
+            use_three_shift INTEGER NOT NULL DEFAULT 0  -- 0=2交代制(日勤/入/明のみ) 1=3交代制(準夜勤も使う)
         )
     """)
     c.execute("INSERT OR IGNORE INTO night_shift_settings (id) VALUES (1)")
+
+    # 簡易マイグレーション: 以前のバージョンのDBに新しいカラムが無い場合、追加する
+    existing_cols = [row[1] for row in c.execute("PRAGMA table_info(night_shift_settings)").fetchall()]
+    if "use_three_shift" not in existing_cols:
+        c.execute("ALTER TABLE night_shift_settings ADD COLUMN use_three_shift INTEGER NOT NULL DEFAULT 0")
+    conn.commit()
 
     # 月またぎ夜勤（前月最終日が夜勤で、当月1日への影響がある場合の入力）
     c.execute("""
@@ -148,7 +194,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             staff_id INTEGER NOT NULL,
             target_month TEXT NOT NULL,  -- YYYY-MM（当月）
-            prev_month_last_shift TEXT,  -- 前月末日の勤務コード（例: N2）
+            prev_month_last_shift TEXT,  -- 前月末日の勤務コード（例: 入）
             FOREIGN KEY (staff_id) REFERENCES staff(id) ON DELETE CASCADE
         )
     """)
@@ -171,27 +217,27 @@ def init_db():
     # シフト区分の初期データ投入
     c.execute("SELECT COUNT(*) FROM shift_types")
     if c.fetchone()[0] == 0:
-        for code, name, start, end, hours, is_night in DEFAULT_SHIFT_TYPES:
+        for code, name, start, end, hours, is_night, leave_amt in DEFAULT_SHIFT_TYPES:
             c.execute(
-                "INSERT INTO shift_types (code, name, start_time, end_time, hours, is_night) VALUES (?,?,?,?,?,?)",
-                (code, name, start, end, hours, int(is_night)),
+                "INSERT INTO shift_types (code, name, start_time, end_time, hours, is_night, leave_amount) VALUES (?,?,?,?,?,?,?)",
+                (code, name, start, end, hours, int(is_night), leave_amt),
             )
         conn.commit()
 
-    # 曜日別必要人数の初期データ投入（全曜日: 日勤 看護師2/介護士3、早出 看護師1/介護士1、夜勤は別テーブルで管理）
+    # 曜日別必要人数の初期データ投入（全曜日: 日勤 看護師2/介護士3、夜勤(入)は別テーブルで管理）
     c.execute("SELECT COUNT(*) FROM staffing_requirements")
     if c.fetchone()[0] == 0:
         default_req = {
-            "D": {"看護師": 2, "介護士": 3},
-            "E": {"看護師": 1, "介護士": 1},
-            "AM": {"看護師": 0, "介護士": 1},
-            "PM": {"看護師": 0, "介護士": 1},
+            "N": {"看護師": 2, "介護士": 3},
+            "準": {"看護師": 1, "介護士": 1},  # 3交代制で使用。2交代制の施設では0にしてお使いください
+            "am": {"看護師": 0, "介護士": 1},  # am/pm対応可の職員のみが割り当て対象になります
+            "pm": {"看護師": 0, "介護士": 1},
         }
         for weekday in range(7):
             for shift_code, jobs in default_req.items():
                 for job_type, cnt in jobs.items():
                     # 入浴日は火・木・土を初期値としておく（施設ごとに変更可能）
-                    is_bath = 1 if weekday in (1, 3, 5) and shift_code in ("D", "E") else 0
+                    is_bath = 1 if weekday in (1, 3, 5) and shift_code == "N" else 0
                     extra = 1 if is_bath and job_type == "介護士" else 0
                     c.execute(
                         "INSERT OR IGNORE INTO staffing_requirements (weekday, shift_code, job_type, required_count, is_bath_day) VALUES (?,?,?,?,?)",
@@ -284,14 +330,15 @@ def calc_paid_leave_grant_days(hire_date_str: str, as_of: date = None) -> int:
 
 
 def calc_paid_leave_balance(staff_id: int, hire_date_str: str) -> dict:
-    """付与日数・消化日数・残日数をまとめて返す"""
+    """付与日数・消化日数（半休は0.5日として計算）・残日数をまとめて返す"""
     granted = calc_paid_leave_grant_days(hire_date_str)
     conn = get_conn()
-    used = conn.execute(
-        "SELECT COUNT(*) FROM paid_leave_usage WHERE staff_id = ?", (staff_id,)
-    ).fetchone()[0]
+    row = conn.execute(
+        "SELECT COALESCE(SUM(amount), 0) FROM paid_leave_usage WHERE staff_id = ?", (staff_id,)
+    ).fetchone()
     conn.close()
-    return {"granted": granted, "used": used, "remaining": max(0, granted - used)}
+    used = row[0] if row and row[0] is not None else 0.0
+    return {"granted": granted, "used": used, "remaining": max(0.0, granted - used)}
 
 
 # ─────────────────────────────────────────────
@@ -304,7 +351,7 @@ seed_sample_staff()
 st.title("🗓️ 勤務表自動生成システム")
 st.caption("看護師・介護士向け シフト管理ツール（試作版）")
 
-tab_names = ["👥 職員登録・一覧", "🌴 有給管理", "⚙️ シフト・条件設定", "🤖 シフト自動生成"]
+tab_names = ["👥 職員登録・一覧", "📅 希望シフト一括入力", "🌴 有給管理", "⚙️ シフト・条件設定", "🤖 シフト自動生成"]
 tabs = st.tabs(tab_names)
 
 # ═════════════════════════════════════════════
@@ -332,6 +379,8 @@ with tabs[0]:
                     f_limit = st.number_input("月間労働時間上限（時間）", min_value=1, max_value=200, value=80)
                 f_night_ok = st.checkbox("夜勤可能", value=True)
                 f_night_target = st.number_input("月間目標夜勤回数", min_value=0, max_value=15, value=4)
+                f_am_pm = st.checkbox("午前(am)・午後(pm)勤務に対応できる", value=False,
+                                       help="チェックを入れた職員だけが、自動生成でam/pm勤務の必要人数の対象になります。")
                 f_note = st.text_input("備考（任意）")
 
             submitted = st.form_submit_button("登録する", type="primary")
@@ -342,10 +391,10 @@ with tabs[0]:
                     conn = get_conn()
                     conn.execute(
                         """INSERT INTO staff (name, job_type, employment_type, monthly_hour_limit,
-                           night_shift_ok, night_shift_target, hire_date, active, note)
-                           VALUES (?,?,?,?,?,?,?,?,?)""",
+                           night_shift_ok, night_shift_target, am_pm_eligible, hire_date, active, note)
+                           VALUES (?,?,?,?,?,?,?,?,?,?)""",
                         (f_name.strip(), f_job, f_emp, f_limit, int(f_night_ok),
-                         f_night_target, f_hire.isoformat(), 1, f_note),
+                         f_night_target, int(f_am_pm), f_hire.isoformat(), 1, f_note),
                     )
                     conn.commit()
                     conn.close()
@@ -398,6 +447,9 @@ with tabs[0]:
                     e_night_ok = st.checkbox("夜勤可能", value=bool(row["night_shift_ok"]), key=f"nok_{row['id']}")
                     e_night_target = st.number_input("月間目標夜勤回数", min_value=0, max_value=15,
                                                        value=int(row["night_shift_target"] or 0), key=f"ntgt_{row['id']}")
+                    e_am_pm = st.checkbox("午前(am)・午後(pm)勤務に対応できる",
+                                           value=bool(row["am_pm_eligible"]) if "am_pm_eligible" in row.index else False,
+                                           key=f"ampm_{row['id']}")
                     e_active = st.checkbox("在籍中", value=bool(row["active"]), key=f"active_{row['id']}")
                 e_note = st.text_input("備考", value=row["note"] or "", key=f"note_{row['id']}")
 
@@ -407,9 +459,9 @@ with tabs[0]:
                         conn = get_conn()
                         conn.execute(
                             """UPDATE staff SET name=?, job_type=?, employment_type=?, monthly_hour_limit=?,
-                               night_shift_ok=?, night_shift_target=?, hire_date=?, active=?, note=?
+                               night_shift_ok=?, night_shift_target=?, am_pm_eligible=?, hire_date=?, active=?, note=?
                                WHERE id=?""",
-                            (e_name, e_job, e_emp, e_limit, int(e_night_ok), e_night_target,
+                            (e_name, e_job, e_emp, e_limit, int(e_night_ok), e_night_target, int(e_am_pm),
                              e_hire.isoformat(), int(e_active), e_note, row["id"]),
                         )
                         conn.commit()
@@ -434,17 +486,17 @@ with tabs[0]:
                 with wc2:
                     w_date = st.date_input("希望日", value=date.today(), key=f"wdate_{row['id']}")
                 with wc3:
-                    w_type = st.selectbox("種別", ["希望休み", "有給希望", "希望勤務"], key=f"wtype_{row['id']}")
-                w_shift_code = ""
-                if w_type == "希望勤務":
-                    w_shift_code = st.selectbox("希望するシフト", [s[0] for s in DEFAULT_SHIFT_TYPES if s[0] not in ("休", "有")],
-                                                 key=f"wshift_{row['id']}")
+                    # 「明」は夜勤入りに自動連動するため、手動での希望対象からは除外する
+                    requestable_codes = [s[0] for s in DEFAULT_SHIFT_TYPES if s[0] != "明"]
+                    w_shift_code = st.selectbox("希望するコード", requestable_codes, key=f"wshift_{row['id']}",
+                                                 help="×=休み希望、年/年am/年pm=有給希望（全休/午前半休/午後半休）、"
+                                                      "N・準・入・am・pm=勤務希望、出/実/研/産/育=特別区分の希望")
                 if st.button("この希望を追加", key=f"waddbtn_{row['id']}"):
                     conn = get_conn()
                     conn.execute(
                         """INSERT INTO staff_constraints (staff_id, target_month, constraint_date,
                            constraint_type, shift_code, memo) VALUES (?,?,?,?,?,?)""",
-                        (row["id"], w_month, w_date.isoformat(), w_type, w_shift_code, ""),
+                        (row["id"], w_month, w_date.isoformat(), "希望", w_shift_code, ""),
                     )
                     conn.commit()
                     conn.close()
@@ -468,9 +520,121 @@ with tabs[0]:
                         st.rerun()
 
 # ═════════════════════════════════════════════
-# TAB 2: 有給管理
+# TAB (新設): 希望シフト一括入力（カレンダー形式）
 # ═════════════════════════════════════════════
 with tabs[1]:
+    st.subheader("📅 希望シフト一括入力（カレンダー形式）")
+    st.caption(
+        "職員名を縦に、日付を横に並べた表形式で、まとめて希望を入力できます。"
+        "セルに直接コードを入力してください（例: 休＝希望休み、有＝有給希望、"
+        "N・準・入・E・AM・PM＝希望勤務）。空欄は「希望なし（自動生成にお任せ）」という意味になります。"
+    )
+
+    conn = get_conn()
+    staff_df = pd.read_sql_query(
+        "SELECT id, name, job_type FROM staff WHERE active=1 ORDER BY job_type, name", conn
+    )
+    conn.close()
+
+    if len(staff_df) == 0:
+        st.info("在籍中の職員が登録されていません。先に「職員登録・一覧」タブで登録してください。")
+    else:
+        grid_month = st.text_input("対象月 (YYYY-MM)", value=date.today().strftime("%Y-%m"), key="grid_month")
+        try:
+            g_year, g_month = map(int, grid_month.split("-"))
+            g_days_in_month = calendar.monthrange(g_year, g_month)[1]
+        except Exception:
+            st.error("月の形式が正しくありません（例: 2026-08）。")
+            g_days_in_month = 0
+
+        if g_days_in_month:
+            date_cols = []
+            for d in range(1, g_days_in_month + 1):
+                wd = date(g_year, g_month, d).weekday()
+                date_cols.append(f"{d}({WEEKDAY_JP[wd]})")
+
+            # 既存の登録済み希望を読み込んで初期表示に反映する
+            conn = get_conn()
+            existing = pd.read_sql_query(
+                "SELECT * FROM staff_constraints WHERE target_month=?", conn, params=(grid_month,)
+            )
+            conn.close()
+
+            grid_data = {"職員名": staff_df["name"].tolist()}
+            for col in date_cols:
+                grid_data[col] = ["" for _ in range(len(staff_df))]
+
+            grid_df = pd.DataFrame(grid_data)
+
+            # 既存データをグリッドに反映
+            id_to_row = {sid: i for i, sid in enumerate(staff_df["id"].tolist())}
+            for _, erow in existing.iterrows():
+                sid = erow["staff_id"]
+                if sid not in id_to_row:
+                    continue
+                try:
+                    d_num = int(erow["constraint_date"].split("-")[2])
+                except Exception:
+                    continue
+                col_match = [c for c in date_cols if c.startswith(f"{d_num}(")]
+                if not col_match:
+                    continue
+                col = col_match[0]
+                grid_df.at[id_to_row[sid], col] = erow["shift_code"] or ""
+
+            st.markdown(
+                "**入力できるコード**：× (休み希望) ／ 年・年am・年pm (有給希望：全休/午前半休/午後半休) ／ "
+                "N・準・入・am・pm (勤務希望) ／ 出・実・研・産・育 (特別区分の希望) ／ 空欄 (希望なし)"
+            )
+            edited_grid = st.data_editor(
+                grid_df,
+                use_container_width=True,
+                height=min(70 + 35 * len(staff_df), 700),
+                disabled=["職員名"],
+                key="shift_request_grid",
+            )
+
+            if st.button("💾 このカレンダーの内容を保存する", type="primary"):
+                # 「明」は自動連動する区分のため、手入力での指定は無視する
+                valid_codes = {s[0] for s in DEFAULT_SHIFT_TYPES if s[0] != "明"}
+                name_to_id = dict(zip(staff_df["name"], staff_df["id"]))
+
+                conn = get_conn()
+                # 当月分の既存の希望をいったん全削除してから、グリッドの内容で作り直す
+                staff_id_list = staff_df["id"].tolist()
+                conn.execute(
+                    f"DELETE FROM staff_constraints WHERE target_month=? AND staff_id IN ({','.join('?' * len(staff_id_list))})",
+                    [grid_month] + staff_id_list,
+                )
+
+                inserted = 0
+                for _, grow in edited_grid.iterrows():
+                    sid = name_to_id.get(grow["職員名"])
+                    if sid is None:
+                        continue
+                    for col in date_cols:
+                        val = str(grow[col]).strip()
+                        if not val or val == "nan":
+                            continue
+                        if val not in valid_codes:
+                            continue  # 誤入力防止のため、無効なコードは保存されません
+                        d_num = int(col.split("(")[0])
+                        c_date = date(g_year, g_month, d_num).isoformat()
+                        conn.execute(
+                            """INSERT INTO staff_constraints (staff_id, target_month, constraint_date,
+                               constraint_type, shift_code, memo) VALUES (?,?,?,?,?,?)""",
+                            (sid, grid_month, c_date, "希望", val, ""),
+                        )
+                        inserted += 1
+                conn.commit()
+                conn.close()
+                st.success(f"{inserted}件の希望を保存しました。")
+                st.rerun()
+
+# ═════════════════════════════════════════════
+# TAB 2: 有給管理
+# ═════════════════════════════════════════════
+with tabs[2]:
     st.subheader("🌴 有給休暇の管理")
     st.caption(
         "入社年月日をもとに、労働基準法第39条の基準（週5日以上勤務のフルタイム基準）で"
@@ -500,54 +664,97 @@ with tabs[1]:
             })
         leave_df = pd.DataFrame(rows)
         st.dataframe(leave_df, use_container_width=True, hide_index=True)
+        st.caption(
+            "「消化日数」は、シフト自動生成で「年」（全休）「年am」「年pm」（半休）が割り当てられると"
+            "自動的に加算されます。半休は0.5日として計算しています。"
+        )
 
         st.divider()
-        st.markdown("**✅ 有給消化の記録を追加する**")
-        lc1, lc2, lc3 = st.columns(3)
+        st.markdown("**✅ 有給消化の記録を手動で追加する**")
+        st.caption("自動生成を使わず紙の勤務表等で先に有給を取得した場合など、手動での記録用です。")
+        lc1, lc2, lc3, lc4 = st.columns(4)
         with lc1:
             l_staff = st.selectbox("職員を選択", staff_df["name"].tolist(), key="leave_staff_select")
         with lc2:
             l_date = st.date_input("取得日", value=date.today(), key="leave_date_input")
         with lc3:
+            l_amount = st.selectbox("消化日数", [1.0, 0.5], format_func=lambda x: "全休(1.0日)" if x == 1.0 else "半休(0.5日)",
+                                     key="leave_amount_input")
+        with lc4:
             l_note = st.text_input("備考（任意）", key="leave_note_input")
 
-        if st.button("この日を有給消化として記録", type="primary"):
+        if st.button("この記録を追加", type="primary"):
             staff_id = int(staff_df[staff_df["name"] == l_staff]["id"].iloc[0])
             conn = get_conn()
             conn.execute(
-                "INSERT INTO paid_leave_usage (staff_id, used_date, note) VALUES (?,?,?)",
-                (staff_id, l_date.isoformat(), l_note),
+                "INSERT INTO paid_leave_usage (staff_id, used_date, amount, source, note) VALUES (?,?,?,?,?)",
+                (staff_id, l_date.isoformat(), l_amount, "手動", l_note),
             )
             conn.commit()
             conn.close()
-            st.success(f"{l_staff} さんの有給消化（{l_date}）を記録しました。")
+            st.success(f"{l_staff} さんの有給消化（{l_date}、{l_amount}日）を記録しました。")
             st.rerun()
 
-        with st.expander("🗑️ 有給消化記録の削除"):
-            conn = get_conn()
-            usage_df = pd.read_sql_query(
-                """SELECT plu.id, s.name as 職員名, plu.used_date as 取得日, plu.note as 備考
-                   FROM paid_leave_usage plu JOIN staff s ON plu.staff_id = s.id
-                   ORDER BY plu.used_date DESC""",
-                conn,
-            )
-            conn.close()
-            if len(usage_df):
-                st.dataframe(usage_df, use_container_width=True, hide_index=True)
-                del_usage_id = st.selectbox("削除する記録のID", [0] + usage_df["id"].tolist())
-                if del_usage_id and st.button("この記録を削除"):
-                    conn = get_conn()
-                    conn.execute("DELETE FROM paid_leave_usage WHERE id=?", (del_usage_id,))
-                    conn.commit()
-                    conn.close()
-                    st.rerun()
-            else:
-                st.caption("消化記録はまだありません。")
+        st.divider()
+        st.markdown("**🔧 消化記録の確認・修正・削除**")
+        st.caption(
+            "自動記録・手動記録どちらも、間違いに気づいたらここから直接修正・削除できます"
+            "（数え間違いや、打刻ミスの訂正などにお使いください）。"
+        )
+        conn = get_conn()
+        usage_df = pd.read_sql_query(
+            """SELECT plu.id, s.name as 職員名, plu.used_date as 取得日, plu.amount as 消化日数,
+               plu.source as 記録方法, plu.note as 備考
+               FROM paid_leave_usage plu JOIN staff s ON plu.staff_id = s.id
+               ORDER BY plu.used_date DESC""",
+            conn,
+        )
+        conn.close()
+        if len(usage_df):
+            st.dataframe(usage_df, use_container_width=True, hide_index=True)
+
+            fix_id = st.selectbox("修正・削除する記録のID", [0] + usage_df["id"].tolist(), key="fix_usage_id")
+            if fix_id:
+                target_row = usage_df[usage_df["id"] == fix_id].iloc[0]
+                fc1, fc2, fc3 = st.columns(3)
+                with fc1:
+                    fix_date = st.date_input("取得日を修正", value=datetime.strptime(target_row["取得日"], "%Y-%m-%d").date(),
+                                              key="fix_date")
+                with fc2:
+                    fix_amount = st.selectbox("消化日数を修正", [1.0, 0.5],
+                                               index=0 if target_row["消化日数"] == 1.0 else 1,
+                                               format_func=lambda x: "全休(1.0日)" if x == 1.0 else "半休(0.5日)",
+                                               key="fix_amount")
+                with fc3:
+                    fix_note = st.text_input("備考を修正", value=target_row["備考"] or "", key="fix_note")
+
+                bcol1, bcol2 = st.columns(2)
+                with bcol1:
+                    if st.button("💾 この記録を修正して保存"):
+                        conn = get_conn()
+                        conn.execute(
+                            "UPDATE paid_leave_usage SET used_date=?, amount=?, source=?, note=? WHERE id=?",
+                            (fix_date.isoformat(), fix_amount, "手動（修正済み）", fix_note, fix_id),
+                        )
+                        conn.commit()
+                        conn.close()
+                        st.success("修正しました。")
+                        st.rerun()
+                with bcol2:
+                    if st.button("🗑️ この記録を削除"):
+                        conn = get_conn()
+                        conn.execute("DELETE FROM paid_leave_usage WHERE id=?", (fix_id,))
+                        conn.commit()
+                        conn.close()
+                        st.warning("削除しました。")
+                        st.rerun()
+        else:
+            st.caption("消化記録はまだありません。")
 
 # ═════════════════════════════════════════════
 # TAB 3: シフト・条件設定
 # ═════════════════════════════════════════════
-with tabs[2]:
+with tabs[3]:
     st.subheader("⚙️ シフト区分・必要人数・夜勤ルールの設定")
 
     sub_tab1, sub_tab2, sub_tab3, sub_tab4 = st.tabs(
@@ -633,8 +840,19 @@ with tabs[2]:
         conn = get_conn()
         ns = conn.execute("SELECT * FROM night_shift_settings WHERE id=1").fetchone()
         conn.close()
-        # (id, standard_nurse, standard_care, allow_flex, flex_nurse, flex_care, max_consecutive_days)
+        # (id, standard_nurse, standard_care, allow_flex, flex_nurse, flex_care, max_consecutive_days, use_three_shift)
 
+        st.markdown("**勤務体制（2交代制 / 3交代制）**")
+        st.caption(
+            "「準夜勤」を使う病院（3交代制：日勤・準夜勤・深夜勤）と、使わない病院"
+            "（2交代制：日勤・夜勤入り〜明けのみ）、どちらにも対応できます。"
+        )
+        use_3shift = st.checkbox(
+            "3交代制を使う（準夜勤あり）", value=bool(ns[7]),
+            help="チェックを外すと2交代制になり、シフト表から「準夜勤」が使われなくなります。"
+        )
+
+        st.divider()
         st.markdown("**標準の夜勤配置**")
         nc1, nc2 = st.columns(2)
         with nc1:
@@ -666,8 +884,8 @@ with tabs[2]:
             conn = get_conn()
             conn.execute(
                 """UPDATE night_shift_settings SET standard_nurse=?, standard_care=?, allow_flex=?,
-                   flex_nurse=?, flex_care=?, max_consecutive_days=? WHERE id=1""",
-                (std_nurse, std_care, int(allow_flex), flex_nurse, flex_care, max_consec),
+                   flex_nurse=?, flex_care=?, max_consecutive_days=?, use_three_shift=? WHERE id=1""",
+                (std_nurse, std_care, int(allow_flex), flex_nurse, flex_care, max_consec, int(use_3shift)),
             )
             conn.commit()
             conn.close()
@@ -689,7 +907,8 @@ with tabs[2]:
         with cm2:
             cm_month = st.text_input("当月 (YYYY-MM)", value=date.today().strftime("%Y-%m"), key="cm_month")
         with cm3:
-            cm_shift = st.selectbox("前月末日の勤務コード", ["N1", "N2"], key="cm_shift")
+            cm_shift = st.selectbox("前月末日の勤務コード", ["入"], key="cm_shift",
+                                     help="前月末日が「入（夜勤入り）」だった場合のみ登録してください。当月1日目が自動的に「明」で確定します。")
 
         if len(staff_df) and st.button("この情報を登録"):
             staff_id = int(staff_df[staff_df["name"] == cm_staff]["id"].iloc[0])
@@ -719,10 +938,18 @@ with tabs[2]:
 def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
     """
     target_month: "YYYY-MM"
-    戻り値: (success: bool, message: str, result_df: DataFrame or None)
+    戻り値: (success: bool, message: str, result_df: DataFrame or None, consult_list: list)
+
+    設計方針:
+    - 「絶対に守るルール」はハード制約: 週1日以上の休日（労基法第35条）、
+      パート等の月間労働時間上限、夜勤不可の職員を夜勤に入れない、施設の連続勤務上限。
+    - 「できるだけ叶えたいルール」はソフト制約（ペナルティの重み付け）: 個人の希望
+      （希望休み・有給希望・希望勤務）、夜勤入りの翌日は明けにする、夜勤回数の平準化、
+      土日勤務の偏り軽減。マンパワー不足で希望通りにならない場合は、ハード制約を破らない
+      範囲で最も希望に近い代替案を提示し、「ご相談」として一覧に残します。
     """
     if not ORTOOLS_AVAILABLE:
-        return False, "OR-Tools がインストールされていません。requirements.txt を確認してください。", None
+        return False, "OR-Tools がインストールされていません。requirements.txt を確認してください。", None, []
 
     year, month = map(int, target_month.split("-"))
     days_in_month = calendar.monthrange(year, month)[1]
@@ -738,20 +965,27 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
     cross_df = pd.read_sql_query(
         "SELECT * FROM cross_month_night WHERE target_month=?", conn, params=(target_month,)
     )
+    leave_amount_map = {row["code"]: row["leave_amount"] for _, row in pd.read_sql_query("SELECT * FROM shift_types", conn).iterrows()}
     conn.close()
 
     if len(staff_df) == 0:
-        return False, "在籍中の職員が登録されていません。", None
+        return False, "在籍中の職員が登録されていません。", None, []
 
-    (_, std_nurse, std_care, allow_flex, flex_nurse, flex_care, max_consec) = ns
+    (_, std_nurse, std_care, allow_flex, flex_nurse, flex_care, max_consec, use_three_shift) = ns
 
-    work_codes = ["D", "N1", "N2", "E", "AM", "PM"]  # 「休」「有」は非勤務扱いとして別管理
-    off_codes = ["休", "有"]
-    all_codes = work_codes + off_codes
-    night_codes = ["N1", "N2"]
+    work_codes = ["N", "準", "入", "am", "pm"]         # 必要人数の対象になる通常勤務
+    special_codes = list(SPECIAL_CODES)                 # 出/実/研/産/育（希望があれば100%反映、必要人数の対象外）
+    leave_codes = list(LEAVE_CODES)                      # 年/年am/年pm
+    rest_codes = ["×", "年"]                             # 週1日休日要件のカウント対象（丸1日休んだ日のみ。半休は含めない＝安全側）
+    all_off_like = ["明", "×"] + leave_codes + special_codes  # 勤務時間としてはカウントしない区分
+    all_codes = work_codes + all_off_like
+    night_codes = ["入"]
 
     staff_ids = staff_df["id"].tolist()
     n_days = len(date_list)
+    nurse_ids = staff_df[staff_df["job_type"] == "看護師"]["id"].tolist()
+    care_ids = staff_df[staff_df["job_type"] == "介護士"]["id"].tolist()
+    am_pm_eligible_ids = set(staff_df[staff_df["am_pm_eligible"] == 1]["id"].tolist())
 
     model = cp_model.CpModel()
 
@@ -767,46 +1001,43 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
         for d in range(n_days):
             model.Add(sum(shift[(s, d, code)] for code in all_codes) == 1)
 
-    # 夜勤可否フラグ：夜勤不可の職員は夜勤に入らない
+    # 2交代制の施設では「準夜勤」を使わない（3交代制のみで使用可能）
+    if not use_three_shift:
+        for s in staff_ids:
+            for d in range(n_days):
+                model.Add(shift[(s, d, "準")] == 0)
+
+    # am/pmは、対応可能フラグが立っている職員以外には割り当てない
+    for s in staff_ids:
+        if s not in am_pm_eligible_ids:
+            for d in range(n_days):
+                model.Add(shift[(s, d, "am")] == 0)
+                model.Add(shift[(s, d, "pm")] == 0)
+
+    # 夜勤可否フラグ：夜勤不可の職員は「入」「準」に入らない（どちらも夜間の勤務のため）
     for _, srow in staff_df.iterrows():
         s = srow["id"]
         if not srow["night_shift_ok"]:
             for d in range(n_days):
-                for code in night_codes:
-                    model.Add(shift[(s, d, code)] == 0)
+                model.Add(shift[(s, d, "入")] == 0)
+                model.Add(shift[(s, d, "準")] == 0)
 
-    # ── ハード制約①: 夜勤の翌日は休み（安全ルール） ──
-    for s in staff_ids:
-        for d in range(n_days - 1):
-            for code in night_codes:
-                # 夜勤に入った場合、翌日は「休」または「有」のみ許可
-                model.Add(
-                    sum(shift[(s, d + 1, oc)] for oc in off_codes) >= shift[(s, d, code)]
-                )
-
-    # ── ハード制約②: 月またぎ夜勤（前月末が夜勤なら当月1日は休み） ──
-    cross_staff_ids = set()
-    for _, crow in cross_df.iterrows():
-        s = crow["staff_id"]
-        if s in staff_ids:
-            cross_staff_ids.add(s)
-            model.Add(sum(shift[(s, 0, oc)] for oc in off_codes) == 1)
-
-    # ── ハード制約③: 連続勤務日数の上限（施設運用ルール） ──
+    # ── ハード制約①: 施設が設定した連続勤務日数の上限（運用ルール） ──
+    # 「明」は実労働ではないので、休みと同様に連勤カウントを途切れさせる扱いにする
+    consec_break_codes = ["明", "×"] + leave_codes
     for s in staff_ids:
         for d in range(n_days - max_consec):
-            window = [sum(shift[(s, d + i, oc)] for oc in off_codes) for i in range(max_consec + 1)]
-            # max_consec+1日間の窓の中に、休み系が最低1日は含まれること
+            window = [sum(shift[(s, d + i, oc)] for oc in consec_break_codes) for i in range(max_consec + 1)]
             model.Add(sum(window) >= 1)
 
-    # ── ハード制約④: 週1日以上の休日（労働基準法第35条・法律上の絶対ルール） ──
-    # 7日間の移動窓ごとに、休み系（休 or 有）が最低1日含まれること
+    # ── ハード制約②: 週1日以上の休日（労働基準法第35条・法律上の絶対ルール） ──
+    # 「明」（夜勤明け）や半休は、丸1日の休養とはみなさず、独立した法定休日としてはカウントしない
     for s in staff_ids:
         for d in range(n_days - 6):
-            week_off = sum(shift[(s, d + i, oc)] for i in range(7) for oc in off_codes)
+            week_off = sum(shift[(s, d + i, oc)] for i in range(7) for oc in rest_codes)
             model.Add(week_off >= 1)
 
-    # ── ハード制約⑤: パート・扶養内の月間労働時間上限 ──
+    # ── ハード制約③: パート・扶養内の月間労働時間上限 ──
     conn = get_conn()
     hours_map = {row["code"]: row["hours"] for _, row in pd.read_sql_query("SELECT * FROM shift_types", conn).iterrows()}
     conn.close()
@@ -816,11 +1047,12 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
             total_minutes = []
             for d in range(n_days):
                 for code in work_codes:
-                    # 時間を10倍した整数で扱う（CP-SATは整数制約のため）
                     total_minutes.append(shift[(s, d, code)] * int(hours_map.get(code, 0) * 10))
             model.Add(sum(total_minutes) <= int(srow["monthly_hour_limit"] * 10))
 
-    # ── ハード制約⑥: 個人希望・有給の反映 ──
+    # ── ハード制約④: 特別区分（出張・実習・研修・産休・育休）の希望は100%反映 ──
+    # これらは会社都合・制度上のものであり、個人の裁量的な希望とは性質が異なるため絶対反映とする
+    request_map = {}  # (staff_id, day_index) -> requested_code
     for _, crow in cons_df.iterrows():
         s = crow["staff_id"]
         if s not in staff_ids:
@@ -831,36 +1063,35 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
             continue
         if d_index < 0 or d_index >= n_days:
             continue
-        if crow["constraint_type"] == "希望休み":
-            model.Add(shift[(s, d_index, "休")] == 1)
-        elif crow["constraint_type"] == "有給希望":
-            model.Add(shift[(s, d_index, "有")] == 1)
-        elif crow["constraint_type"] == "希望勤務" and crow["shift_code"] in work_codes:
-            model.Add(shift[(s, d_index, crow["shift_code"])] == 1)
+        req_code = crow["shift_code"]
+        if req_code not in all_codes:
+            continue
+        request_map[(s, d_index)] = req_code
+        if req_code in special_codes:
+            model.Add(shift[(s, d_index, req_code)] == 1)
 
-    # ── ハード制約⑦: 日別・シフト別の必要人数（日勤系は職種ごとに厳密に満たす） ──
-    nurse_ids = staff_df[staff_df["job_type"] == "看護師"]["id"].tolist()
-    care_ids = staff_df[staff_df["job_type"] == "介護士"]["id"].tolist()
-
+    # ── ハード制約⑤: 日別・シフト別の必要人数（通常勤務のみ、特別区分は対象外） ──
     for d in range(n_days):
-        weekday = date_list[d].weekday()  # 0=月
+        weekday = date_list[d].weekday()
         day_req = req_df[req_df["weekday"] == weekday]
         for _, rr in day_req.iterrows():
             code = rr["shift_code"]
             job_type = rr["job_type"]
             need = int(rr["required_count"])
-            ids = nurse_ids if job_type == "看護師" else care_ids
-            if need > 0 and code in work_codes:
-                model.Add(sum(shift[(s, d, code)] for s in ids) >= need)
+            if code not in work_codes or need <= 0:
+                continue
+            if code in ("am", "pm"):
+                ids = [i for i in (nurse_ids if job_type == "看護師" else care_ids) if i in am_pm_eligible_ids]
+            else:
+                ids = nurse_ids if job_type == "看護師" else care_ids
+            model.Add(sum(shift[(s, d, code)] for s in ids) >= need)
 
-    # ── ハード制約⑧: 夜勤人数（標準 or 柔軟対応） ──
+    # ── ハード制約⑥: 夜勤人数（標準 or 柔軟対応） ──
     for d in range(n_days):
         for code in night_codes:
             nurse_in_night = sum(shift[(s, d, code)] for s in nurse_ids)
             care_in_night = sum(shift[(s, d, code)] for s in care_ids)
             if allow_flex:
-                # 「標準構成」または「柔軟構成」のどちらかを満たせばよい、という制約は
-                # CP-SATでは論理OR（ブール変数で分岐）として表現する
                 use_standard = model.NewBoolVar(f"std_{d}_{code}")
                 use_flex = model.NewBoolVar(f"flex_{d}_{code}")
                 model.Add(use_standard + use_flex == 1)
@@ -872,8 +1103,43 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
                 model.Add(nurse_in_night >= std_nurse)
                 model.Add(care_in_night >= std_care)
 
-    # ── ソフト制約: 夜勤回数の目標達成度（平準化） ──
-    penalty_terms = []
+    # ═══════════════ ここからソフト制約（できるだけ叶えたいルール） ═══════════════
+    penalty_terms = []  # (weight, BoolVar or IntVar) のリスト
+
+    # ── ソフト①: 個人の希望（休み・有給・勤務）はできるだけ反映する。矛盾する場合は「ご相談」扱い ──
+    REQUEST_WEIGHT = 1000
+    for (s, d_index), req_code in request_map.items():
+        if req_code in special_codes:
+            continue  # ハード制約側で既に100%反映済み
+        # 希望が叶わなかった場合に1になる変数
+        unmet = model.NewBoolVar(f"unmet_{s}_{d_index}")
+        model.Add(shift[(s, d_index, req_code)] == 1).OnlyEnforceIf(unmet.Not())
+        model.Add(shift[(s, d_index, req_code)] == 0).OnlyEnforceIf(unmet)
+        penalty_terms.append((REQUEST_WEIGHT, unmet))
+
+    # ── ソフト②: 夜勤入り(入)の翌日は明けを強く推奨（本人希望があればそちらを優先） ──
+    NIGHT_REST_WEIGHT = 60
+    for s in staff_ids:
+        for d in range(n_days - 1):
+            # 翌日に個人希望が指定されている場合は、その希望が優先されるため、
+            # この推奨ルールのペナルティを課さない
+            if (s, d + 1) in request_map:
+                continue
+            # 「入」だったのに翌日が「明」にならなかった場合に1になる変数
+            aux = model.NewBoolVar(f"nrest_aux_{s}_{d}")
+            model.Add(shift[(s, d + 1, "明")] >= shift[(s, d, "入")] - aux)
+            penalty_terms.append((NIGHT_REST_WEIGHT, aux))
+
+    # ── ソフト③: 月またぎ夜勤の翌日も明けを強く推奨（絶対ではない） ──
+    for _, crow in cross_df.iterrows():
+        s = crow["staff_id"]
+        if s not in staff_ids or (s, 0) in request_map:
+            continue
+        aux = model.NewBoolVar(f"crossrest_aux_{s}")
+        model.Add(shift[(s, 0, "明")] >= 1 - aux)
+        penalty_terms.append((NIGHT_REST_WEIGHT, aux))
+
+    # ── ソフト④: 夜勤回数の目標達成度（目標の前後1回は許容、それ以上ずれたらペナルティ） ──
     for _, srow in staff_df.iterrows():
         s = srow["id"]
         if not srow["night_shift_ok"]:
@@ -882,11 +1148,13 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
         actual = sum(shift[(s, d, code)] for d in range(n_days) for code in night_codes)
         diff = model.NewIntVar(-31, 31, f"night_diff_{s}")
         model.Add(diff == actual - target)
-        abs_diff = model.NewIntVar(0, 31, f"night_absdiff_{s}")
-        model.AddAbsEquality(abs_diff, diff)
-        penalty_terms.append(abs_diff)
+        excess = model.NewIntVar(0, 31, f"night_excess_{s}")
+        # |diff| が1を超えた分だけをペナルティ対象にする（前後1回は無罰）
+        model.Add(excess >= diff - 1)
+        model.Add(excess >= -diff - 1)
+        penalty_terms.append((10, excess))
 
-    # ── ソフト制約: 土日休みの偏りを減らす（土日勤務日数のばらつきを抑える） ──
+    # ── ソフト⑤: 土日勤務の偏りを減らす ──
     weekend_days = [d for d in range(n_days) if date_list[d].weekday() >= 5]
     if weekend_days:
         weekend_work_counts = []
@@ -900,10 +1168,10 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
             model.AddMinEquality(min_wc, weekend_work_counts)
             weekend_spread = model.NewIntVar(0, len(weekend_days), "weekend_spread")
             model.Add(weekend_spread == max_wc - min_wc)
-            penalty_terms.append(weekend_spread)
+            penalty_terms.append((5, weekend_spread))
 
     if penalty_terms:
-        model.Minimize(sum(penalty_terms))
+        model.Minimize(sum(w * v for w, v in penalty_terms))
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit_sec
@@ -912,42 +1180,68 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
 
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return False, (
-            "条件を満たすシフトが見つかりませんでした。必要人数・希望休みの数・"
-            "月間上限時間などが厳しすぎる可能性があります。設定を見直してください。"
-        ), None
+            "絶対に守るべき条件（週1日休日、月間労働時間上限、必要人数など）だけでも"
+            "満たすシフトが見つかりませんでした。必要人数の設定や職員数を見直してください。"
+        ), None, []
 
     # 結果をDataFrameに整形（縦軸: 職員名、横軸: 日付）
     result_rows = []
     name_map = dict(zip(staff_df["id"], staff_df["name"]))
     job_map = dict(zip(staff_df["id"], staff_df["job_type"]))
+    assigned_map = {}  # (s, d) -> code
     for s in staff_ids:
         row = {"職員名": name_map[s], "職種": job_map[s]}
         for d in range(n_days):
             for code in all_codes:
                 if solver.Value(shift[(s, d, code)]) == 1:
                     row[f"{date_list[d].day}日({WEEKDAY_JP[date_list[d].weekday()]})"] = code
+                    assigned_map[(s, d)] = code
                     break
         result_rows.append(row)
     result_df = pd.DataFrame(result_rows)
 
-    # DBへ保存（既存の当月データは一旦削除してから登録）
+    # ── 「ご相談」判定: 個人希望と実際の割り当てが食い違った箇所を洗い出す ──
+    consult_list = []
+    for (s, d_index), req_code in request_map.items():
+        actual_code = assigned_map.get((s, d_index), "")
+        if actual_code != req_code:
+            consult_list.append({
+                "職員名": name_map[s],
+                "日付": f"{date_list[d_index].month}/{date_list[d_index].day}({WEEKDAY_JP[date_list[d_index].weekday()]})",
+                "希望していた内容": req_code,
+                "実際の割り当て（代替案）": actual_code,
+            })
+
+    # ── DBへ保存（既存の当月データは一旦削除してから登録） ──
     conn = get_conn()
     conn.execute("DELETE FROM generated_shifts WHERE target_month=?", (target_month,))
-    for s in staff_ids:
-        for d in range(n_days):
-            for code in all_codes:
-                if solver.Value(shift[(s, d, code)]) == 1:
-                    conn.execute(
-                        "INSERT INTO generated_shifts (staff_id, target_month, work_date, shift_code) VALUES (?,?,?,?)",
-                        (s, target_month, date_list[d].isoformat(), code),
-                    )
-                    break
+    for (s, d), code in assigned_map.items():
+        conn.execute(
+            "INSERT INTO generated_shifts (staff_id, target_month, work_date, shift_code) VALUES (?,?,?,?)",
+            (s, target_month, date_list[d].isoformat(), code),
+        )
+    conn.commit()
+
+    # ── 有給の自動消化記録（年・年am・年pmが割り当てられた職員分を自動記録） ──
+    # 同じ月・同じ内容の自動記録が既にある場合は重複させないよう、まず当月分の自動記録を削除してから作り直す
+    conn.execute(
+        "DELETE FROM paid_leave_usage WHERE source='自動' AND used_date LIKE ?",
+        (f"{target_month}-%",),
+    )
+    for (s, d), code in assigned_map.items():
+        amt = leave_amount_map.get(code, 0)
+        if amt and amt > 0:
+            conn.execute(
+                "INSERT INTO paid_leave_usage (staff_id, used_date, amount, source, note) VALUES (?,?,?,?,?)",
+                (s, date_list[d].isoformat(), amt, "自動", "シフト自動生成による自動記録"),
+            )
     conn.commit()
     conn.close()
 
     status_msg = "最適解が見つかりました。" if status == cp_model.OPTIMAL else "実行可能な解が見つかりました（時間内での最善解）。"
-    return True, status_msg, result_df
-
+    if consult_list:
+        status_msg += f" ただし、{len(consult_list)}件、希望通りにならなかった箇所があります（下の「ご相談」一覧をご確認ください）。"
+    return True, status_msg, result_df, consult_list
 
 def build_excel_export(result_df: pd.DataFrame, target_month: str) -> bytes:
     """シフト結果を、集計列付きのExcelバイト列として返す"""
@@ -961,9 +1255,9 @@ def build_excel_export(result_df: pd.DataFrame, target_month: str) -> bytes:
     day_counts, night_counts, paid_counts, total_hours = [], [], [], []
     for _, row in export_df.iterrows():
         codes = [row[c] for c in day_cols]
-        day_counts.append(sum(1 for c in codes if c == "D"))
-        night_counts.append(sum(1 for c in codes if c in ("N1", "N2")))
-        paid_counts.append(sum(1 for c in codes if c == "有"))
+        day_counts.append(sum(1 for c in codes if c == "N"))
+        night_counts.append(sum(1 for c in codes if c == "入"))
+        paid_counts.append(sum(1 for c in codes if c == "年") + sum(0.5 for c in codes if c in ("年am", "年pm")))
         total_hours.append(round(sum(hours_map.get(c, 0) for c in codes), 1))
 
     export_df["日勤回数"] = day_counts
@@ -985,7 +1279,7 @@ def build_excel_export(result_df: pd.DataFrame, target_month: str) -> bytes:
 # ═════════════════════════════════════════════
 # TAB 4: シフト自動生成
 # ═════════════════════════════════════════════
-with tabs[3]:
+with tabs[4]:
     st.subheader("🤖 シフト自動生成")
 
     if not ORTOOLS_AVAILABLE:
@@ -993,17 +1287,22 @@ with tabs[3]:
     else:
         st.markdown("""
         **このエンジンが厳格に守る「絶対ルール」**
-        - 夜勤の翌日は必ず休み（安全のための施設ルール）
-        - 前月末が夜勤だった職員は、当月1日を必ず休みにする（月またぎ夜勤の考慮）
-        - 施設で設定した連続勤務日数を超えない
-        - **7日間のうち必ず1日以上の休日を確保する（労働基準法第35条）**
+        - 週1日以上の休日は必ず確保する（労働基準法第35条・絶対ルール）
         - パート・扶養内の職員は、設定した月間労働時間の上限を超えない
-        - 登録済みの希望休み・有給希望・希望勤務は100%反映する
+        - 施設で設定した連続勤務日数を超えない
+        - 出張・実習・研修・産休・育休の希望は100%反映する
         - 介護士が不足する夜勤は、設定に応じて看護師で自動補填する
+        - 午前(am)・午後(pm)勤務は、対応可能と設定した職員にのみ割り当てる
 
-        **できるだけ叶えようとする「努力目標」**
-        - 夜勤可能な職員の間で、夜勤回数が目標回数に近くなるようにする
+        **できるだけ叶えようとする「努力目標」（マンパワー不足の場合は柔軟に調整）**
+        - 希望休み・有給希望・希望勤務は、できる限り反映する（強い優先度）
+        - 夜勤入り(入)の翌日は明け(明)にすることを推奨するが、本人希望や人手不足の状況次第では
+          夜勤の連続や、夜勤明けすぐの日勤なども許容する（絶対には縛らない）
+        - 夜勤可能な職員の間で、夜勤回数が目標回数の前後1回以内に収まるようにする
         - 土日の勤務日数が特定の職員に偏らないようにする
+
+        希望が重なって両立できない場合は、生成結果と一緒に「ご相談」一覧に表示し、
+        実際にどう割り当てたか（代替案）も分かるようにします。
         """)
 
         gen_month = st.text_input("生成する月 (YYYY-MM)", value=date.today().strftime("%Y-%m"))
@@ -1012,11 +1311,12 @@ with tabs[3]:
 
         if st.button("🚀 この条件でシフトを自動生成する", type="primary"):
             with st.spinner("計算中です。しばらくお待ちください…"):
-                success, message, result_df = build_and_solve_schedule(gen_month, time_limit)
+                success, message, result_df, consult_list = build_and_solve_schedule(gen_month, time_limit)
             if success:
                 st.success(message)
                 st.session_state["last_result_df"] = result_df
                 st.session_state["last_result_month"] = gen_month
+                st.session_state["last_consult_list"] = consult_list
             else:
                 st.error(message)
 
@@ -1024,6 +1324,16 @@ with tabs[3]:
             st.divider()
             st.markdown(f"### 📋 {st.session_state['last_result_month']} のシフト表")
             st.dataframe(st.session_state["last_result_df"], use_container_width=True, hide_index=True, height=600)
+
+            consult_list = st.session_state.get("last_consult_list", [])
+            if consult_list:
+                st.divider()
+                st.markdown("### 💬 ご相談（希望通りにならなかった箇所）")
+                st.caption(
+                    "人手の都合上、以下の希望はそのまま反映できませんでした。"
+                    "「実際の割り当て（代替案）」の内容でよいか、本人と相談のうえご確認ください。"
+                )
+                st.dataframe(pd.DataFrame(consult_list), use_container_width=True, hide_index=True)
 
             excel_bytes = build_excel_export(st.session_state["last_result_df"], st.session_state["last_result_month"])
             st.download_button(
