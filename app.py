@@ -388,7 +388,7 @@ seed_sample_staff()
 st.title("🗓️ 勤務表自動生成システム")
 st.caption("看護師・介護士向け シフト管理ツール（試作版）")
 
-tab_names = ["👥 職員登録・一覧", "📅 希望シフト一括入力", "🌴 有給管理", "⚙️ シフト・条件設定", "🤖 シフト自動生成"]
+tab_names = ["👥 職員登録・一覧", "📅 希望シフト一括入力", "🌴 有給管理", "⚙️ シフト・条件設定", "🤖 シフト自動生成", "💾 バックアップ"]
 tabs = st.tabs(tab_names)
 
 # ═════════════════════════════════════════════
@@ -592,9 +592,9 @@ with tabs[1]:
             st.markdown(
                 "**日付のセルをタップすると、希望コードを選べます。**　"
                 "×=休み希望／年・年am・年pm=有給希望（全休/午前半休/午後半休）／"
-                "N・準・入・am・pm=勤務希望／出・実・研・産・育=特別区分の希望／空欄=希望なし"
+                "N・準・入・明・am・pm=勤務希望／出・実・研・産・育=特別区分の希望／空欄=希望なし"
             )
-            requestable_codes = [""] + [s[0] for s in DEFAULT_SHIFT_TYPES if s[0] != "明"]
+            requestable_codes = [""] + [s[0] for s in DEFAULT_SHIFT_TYPES]
             column_config = {
                 "職員名": st.column_config.TextColumn("職員名", disabled=True),
             }
@@ -612,8 +612,7 @@ with tabs[1]:
             )
 
             if st.button("💾 このカレンダーの内容を保存する", type="primary"):
-                # 「明」は自動連動する区分のため、手入力での指定は無視する
-                valid_codes = {s[0] for s in DEFAULT_SHIFT_TYPES if s[0] != "明"}
+                valid_codes = {s[0] for s in DEFAULT_SHIFT_TYPES}
                 name_to_id = dict(zip(staff_df["name"], staff_df["id"]))
 
                 conn = get_conn()
@@ -1398,3 +1397,68 @@ with tabs[4]:
                 file_name=f"シフト表_{st.session_state['last_result_month']}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
+
+# ═════════════════════════════════════════════
+# TAB (新設): バックアップ（PC・タブレットへの保存と復元）
+# ═════════════════════════════════════════════
+with tabs[5]:
+    st.subheader("💾 データのバックアップ")
+    st.warning(
+        "⚠️ **このアプリのデータは、Streamlit Cloud上に保存されています。**\n\n"
+        "GitHubのコードを更新して再デプロイされたタイミングなどで、まれにデータが"
+        "リセットされてしまうことがあります。**大事な操作（月初の登録作業が終わった時など）の後は、"
+        "こまめにバックアップをPC・タブレットに保存しておくことを強くおすすめします。**"
+    )
+
+    st.markdown("### 📥 バックアップを保存する")
+    st.caption(
+        "職員情報・シフト希望・有給記録・生成済みシフト表・各種設定など、すべてのデータを"
+        "1つのファイルにまとめてダウンロードできます。PC・タブレットの分かりやすい場所に保存してください。"
+    )
+    try:
+        with open(DB_PATH, "rb") as f:
+            db_bytes = f.read()
+        backup_filename = f"shift_app_backup_{date.today().isoformat()}.db"
+        st.download_button(
+            label="💾 今すぐバックアップをダウンロード",
+            data=db_bytes,
+            file_name=backup_filename,
+            mime="application/octet-stream",
+            type="primary",
+        )
+        st.caption(f"現在のデータサイズ: 約{len(db_bytes) / 1024:.1f} KB")
+    except FileNotFoundError:
+        st.info("まだデータがありません。")
+
+    st.divider()
+
+    st.markdown("### 📤 バックアップから復元する")
+    st.error(
+        "⚠️ **復元すると、今アプリに入っている内容はすべて上書きされます。** "
+        "本当に必要な時だけお使いください。"
+    )
+    uploaded_file = st.file_uploader(
+        "バックアップファイル（.db）を選んでください",
+        type=["db"],
+        key="restore_uploader",
+    )
+    if uploaded_file is not None:
+        st.write(f"選択されたファイル: {uploaded_file.name}（{uploaded_file.size / 1024:.1f} KB）")
+        confirm_restore = st.checkbox("内容を確認しました。このファイルで今のデータを上書きします。")
+        if confirm_restore and st.button("🔄 このバックアップで復元する", type="primary"):
+            try:
+                with open(DB_PATH, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
+                st.success("復元が完了しました。画面を再読み込みします…")
+                st.rerun()
+            except Exception as e:
+                st.error(f"復元中にエラーが発生しました: {e}")
+
+    st.divider()
+    st.markdown("### 🕐 自動バックアップのおすすめタイミング")
+    st.markdown("""
+    - 新しい月のシフト希望をすべて入力し終えたとき
+    - シフトを自動生成して、内容を確定したとき
+    - 職員の入退社などマスター情報を変更したとき
+    - GitHubのコードを更新する前（念のため）
+    """)
