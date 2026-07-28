@@ -1216,6 +1216,16 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
         if req_code in special_codes:
             model.Add(shift[(s, d_index, req_code)] == 1)
 
+    # 希望の無い(職員,日)には、特別区分・有給を自由に割り当てさせない
+    # （希望していない人に「育」「産」などが勝手に割り振られる誤動作を防ぐ）
+    restrict_codes = special_codes + leave_codes
+    for s in staff_ids:
+        for d in range(n_days):
+            req_here = request_map.get((s, d))
+            for code in restrict_codes:
+                if code != req_here:
+                    model.Add(shift[(s, d, code)] == 0)
+
     # ── ハード制約⑤: 日別・シフト別の必要人数（特別対応日 > 曜日別設定の優先順位） ──
     for d in range(n_days):
         weekday = date_list[d].weekday()
@@ -1371,6 +1381,13 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
         for (s, d_index), req_code in request_map.items():
             if req_code in special_codes:
                 diag_model.Add(diag_shift[(s, d_index, req_code)] == 1)
+        restrict_codes = special_codes + leave_codes
+        for s in staff_ids:
+            for d in range(n_days):
+                req_here = request_map.get((s, d))
+                for code in restrict_codes:
+                    if code != req_here:
+                        diag_model.Add(diag_shift[(s, d, code)] == 0)
         # 夜勤は「誰か1名以上いればOK」まで緩めた最小版
         for d in range(n_days):
             diag_model.Add(sum(diag_shift[(s, d, "入")] for s in staff_ids) >= 1)
@@ -1411,14 +1428,14 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
     # ── 日別の集計行を末尾に追加する ──
     date_col_names = [f"{date_list[d].day}日({WEEKDAY_JP[date_list[d].weekday()]})" for d in range(n_days)]
     summary_defs = [
-        ("日勤 看護師", "N", "看護師"), ("日勤 介護士", "N", "介護士"),
-        ("夜勤入り 看護師", "入", "看護師"), ("夜勤明け 看護師", "明", "看護師"),
-        ("夜勤入り 介護士", "入", "介護士"), ("夜勤明け 介護士", "明", "介護士"),
+        ("日勤(看)", "N", "看護師"), ("日勤(介)", "N", "介護士"),
+        ("入り(看)", "入", "看護師"), ("明け(看)", "明", "看護師"),
+        ("入り(介)", "入", "介護士"), ("明け(介)", "明", "介護士"),
         ("休み", "×", None),
     ]
     summary_rows = []
     for label, target_code, target_job in summary_defs:
-        srow = {"職員名": f"【集計】{label}", "職種": ""}
+        srow = {"職員名": f"▼{label}", "職種": ""}
         for d in range(n_days):
             cnt = 0
             for s in staff_ids:
@@ -1482,7 +1499,7 @@ def build_excel_export(result_df: pd.DataFrame, target_month: str) -> bytes:
 
     day_cols = [c for c in result_df.columns if c not in ("職員名", "職種")]
 
-    is_summary_row = result_df["職員名"].astype(str).str.startswith("【集計】")
+    is_summary_row = result_df["職員名"].astype(str).str.startswith("▼")
     staff_only_df = result_df[~is_summary_row].copy()
     summary_only_df = result_df[is_summary_row].copy()
 
@@ -1562,7 +1579,9 @@ with tabs[4]:
         if "last_result_df" in st.session_state:
             st.divider()
             st.markdown(f"### 📋 {st.session_state['last_result_month']} のシフト表")
-            st.dataframe(st.session_state["last_result_df"], use_container_width=True, hide_index=True, height=600)
+            result_col_config = {"職員名": st.column_config.TextColumn("職員名", width="medium")}
+            st.dataframe(st.session_state["last_result_df"], use_container_width=True, hide_index=True,
+                         height=600, column_config=result_col_config)
 
             consult_list = st.session_state.get("last_consult_list", [])
             if consult_list:
