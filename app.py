@@ -1256,7 +1256,7 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
 
     # 希望の無い(職員,日)には、特別区分・有給を自由に割り当てさせない
     # （希望していない人に「育」「産」などが勝手に割り振られる誤動作を防ぐ）
-    restrict_codes = special_codes + leave_codes
+    restrict_codes = special_codes + leave_codes + ["am", "pm"]
     for s in staff_ids:
         for d in range(n_days):
             req_here = request_map.get((s, d))
@@ -1360,7 +1360,7 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
         # |diff| が1を超えた分だけをペナルティ対象にする（前後1回は無罰）
         model.Add(excess >= diff - 1)
         model.Add(excess >= -diff - 1)
-        penalty_terms.append((10, excess))
+        penalty_terms.append((40, excess))
 
     # ── ソフト⑤: 土日勤務の偏りを減らす ──
     weekend_days = [d for d in range(n_days) if date_list[d].weekday() >= 5]
@@ -1437,7 +1437,7 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
         for (s, d_index), req_code in request_map.items():
             if req_code in special_codes:
                 diag_model.Add(diag_shift[(s, d_index, req_code)] == 1)
-        restrict_codes = special_codes + leave_codes
+        restrict_codes = special_codes + leave_codes + ["am", "pm"]
         for s in staff_ids:
             for d in range(n_days):
                 req_here = request_map.get((s, d))
@@ -1465,19 +1465,28 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
                 "希望休みが厳しすぎる可能性があります。まずは職員を増やすか、条件を緩めてお試しください。"
             ), None, []
 
-    # 結果をDataFrameに整形（縦軸: 職員名、横軸: 日付）
+    # 結果をDataFrameに整形（縦軸: 職員名、横軸: 日付、末尾に各種回数の集計列）
     result_rows = []
     name_map = dict(zip(staff_df["id"], staff_df["name"]))
     job_map = dict(zip(staff_df["id"], staff_df["job_type"]))
     assigned_map = {}  # (s, d) -> code
     for s in staff_ids:
         row = {"職員名": name_map[s], "職種": job_map[s]}
+        codes_this_staff = []
         for d in range(n_days):
             for code in all_codes:
                 if solver.Value(shift[(s, d, code)]) == 1:
                     row[f"{date_list[d].day}日({WEEKDAY_JP[date_list[d].weekday()]})"] = code
                     assigned_map[(s, d)] = code
+                    codes_this_staff.append(code)
                     break
+        row["日勤"] = codes_this_staff.count("N")
+        row["夜勤入り"] = codes_this_staff.count("入")
+        row["夜勤明け"] = codes_this_staff.count("明")
+        row["公休"] = codes_this_staff.count("×")
+        row["年休"] = codes_this_staff.count("年") + 0.5 * (codes_this_staff.count("年am") + codes_this_staff.count("年pm"))
+        row["am"] = codes_this_staff.count("am")
+        row["pm"] = codes_this_staff.count("pm")
         result_rows.append(row)
     result_df = pd.DataFrame(result_rows)
 
@@ -1635,9 +1644,9 @@ with tabs[4]:
         if "last_result_df" in st.session_state:
             st.divider()
             st.markdown(f"### 📋 {st.session_state['last_result_month']} のシフト表")
-            result_col_config = {"職員名": st.column_config.TextColumn("職員名", width="medium")}
-            st.dataframe(st.session_state["last_result_df"], use_container_width=True, hide_index=True,
-                         height=600, column_config=result_col_config)
+            st.caption("👤 職員名は左端に固定されるので、横にスクロールしても分かりやすいです。")
+            display_df = st.session_state["last_result_df"].set_index("職員名")
+            st.dataframe(display_df, use_container_width=True, height=600)
 
             consult_list = st.session_state.get("last_consult_list", [])
             if consult_list:
