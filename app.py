@@ -1120,7 +1120,9 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
     work_codes = ["N", "準", "入", "am", "pm"]         # 必要人数の対象になる通常勤務
     special_codes = list(SPECIAL_CODES)                 # 出/実/研/産/育（希望があれば100%反映、必要人数の対象外）
     leave_codes = list(LEAVE_CODES)                      # 年/年am/年pm
-    rest_codes = ["×", "年"]                             # 週1日休日要件のカウント対象（丸1日休んだ日のみ。半休は含めない＝安全側）
+    rest_codes = ["×", "年"] + special_codes             # 週1日休日要件のカウント対象。半休は含めない＝安全側。
+    # 産休・育休・出張・研修・実習は「施設での通常勤務ではない」ため、この期間中に
+    # 週1休日や連勤上限の違反が強制的に発生しないよう、休養扱いに含める。
     all_off_like = ["明", "×"] + leave_codes + special_codes  # 勤務時間としてはカウントしない区分
     all_codes = work_codes + all_off_like
     night_codes = ["入"]
@@ -1168,7 +1170,7 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
 
     # ── ハード制約①: 施設が設定した連続勤務日数の上限（運用ルール） ──
     # 「明」は実労働ではないので、休みと同様に連勤カウントを途切れさせる扱いにする
-    consec_break_codes = ["明", "×"] + leave_codes
+    consec_break_codes = ["明", "×"] + leave_codes + special_codes
     for s in staff_ids:
         for d in range(n_days - max_consec):
             window = [sum(shift[(s, d + i, oc)] for oc in consec_break_codes) for i in range(max_consec + 1)]
