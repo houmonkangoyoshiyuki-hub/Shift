@@ -167,6 +167,18 @@ def init_db():
         )
     """)
 
+    # 日付単位の特別対応日（イレギュラーで特定の日だけ最低人数を変えたい場合）
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS date_overrides (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            target_date TEXT NOT NULL,   -- YYYY-MM-DD
+            shift_code TEXT NOT NULL,
+            job_type TEXT NOT NULL,
+            required_count INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(target_date, shift_code, job_type)
+        )
+    """)
+
     # 夜勤の柔軟配置設定（施設全体で1つ）
     c.execute("""
         CREATE TABLE IF NOT EXISTS night_shift_settings (
@@ -915,6 +927,50 @@ with tabs[3]:
             st.success("保存しました。")
             st.rerun()
 
+        st.divider()
+        st.markdown("### 🔁 特定の日だけ変更する（特別対応日）")
+        st.caption(
+            "入浴介助日がイレギュラーで変わった時など、曜日のルールとは別に「この日だけ」"
+            "最低人数を上書きできます。ここで登録した日は、曜日の設定より優先されます。"
+        )
+        oc1, oc2, oc3, oc4 = st.columns(4)
+        with oc1:
+            o_date = st.date_input("対象日", value=date.today(), key="override_date")
+        with oc2:
+            o_code = st.selectbox("シフト区分", ["N", "準", "am", "pm"], key="override_code")
+        with oc3:
+            o_job = st.selectbox("職種", ["看護師", "介護士"], key="override_job")
+        with oc4:
+            o_cnt = st.number_input("最低人数", min_value=0, max_value=20, value=1, key="override_cnt")
+        if st.button("この日の特別対応を登録"):
+            conn = get_conn()
+            conn.execute(
+                """INSERT INTO date_overrides (target_date, shift_code, job_type, required_count)
+                   VALUES (?,?,?,?)
+                   ON CONFLICT(target_date, shift_code, job_type) DO UPDATE SET required_count=excluded.required_count""",
+                (o_date.isoformat(), o_code, o_job, o_cnt),
+            )
+            conn.commit()
+            conn.close()
+            st.success(f"{o_date} の特別対応を登録しました。")
+            st.rerun()
+
+        conn = get_conn()
+        override_df = pd.read_sql_query(
+            "SELECT id, target_date as 日付, shift_code as 区分, job_type as 職種, required_count as 最低人数 "
+            "FROM date_overrides ORDER BY target_date", conn,
+        )
+        conn.close()
+        if len(override_df):
+            st.dataframe(override_df, use_container_width=True, hide_index=True)
+            del_ov_id = st.selectbox("削除する特別対応のID", [0] + override_df["id"].tolist(), key="del_override")
+            if del_ov_id and st.button("この特別対応を削除"):
+                conn = get_conn()
+                conn.execute("DELETE FROM date_overrides WHERE id=?", (del_ov_id,))
+                conn.commit()
+                conn.close()
+                st.rerun()
+
     # ── 夜勤の配置ルール ──
     with sub_tab3:
         conn = get_conn()
@@ -1050,6 +1106,9 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
     cross_df = pd.read_sql_query(
         "SELECT * FROM cross_month_night WHERE target_month=?", conn, params=(target_month,)
     )
+    override_df = pd.read_sql_query(
+        "SELECT * FROM date_overrides WHERE target_date LIKE ?", conn, params=(f"{target_month}-%",)
+    )
     leave_amount_map = {row["code"]: row["leave_amount"] for _, row in pd.read_sql_query("SELECT * FROM shift_types", conn).iterrows()}
     conn.close()
 
@@ -1155,14 +1214,17 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
         if req_code in special_codes:
             model.Add(shift[(s, d_index, req_code)] == 1)
 
-    # ── ハード制約⑤: 日別・シフト別の必要人数（通常勤務のみ、特別区分は対象外） ──
+    # ── ハード制約⑤: 日別・シフト別の必要人数（特別対応日 > 曜日別設定の優先順位） ──
     for d in range(n_days):
         weekday = date_list[d].weekday()
+        d_iso = date_list[d].isoformat()
+        day_override = override_df[override_df["target_date"] == d_iso]
         day_req = req_df[req_df["weekday"] == weekday]
-        for _, rr in day_req.iterrows():
-            code = rr["shift_code"]
-            job_type = rr["job_type"]
-            need = int(rr["required_count"])
+        # (shift_code, job_type) -> required_count のマップを作り、特別対応日で上書きする
+        need_map = {(rr["shift_code"], rr["job_type"]): int(rr["required_count"]) for _, rr in day_req.iterrows()}
+        for _, orow in day_override.iterrows():
+            need_map[(orow["shift_code"], orow["job_type"])] = int(orow["required_count"])
+        for (code, job_type), need in need_map.items():
             if code not in work_codes or need <= 0:
                 continue
             if code in ("am", "pm"):
@@ -1267,10 +1329,66 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
     status = solver.Solve(model)
 
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return False, (
-            "絶対に守るべき条件（週1日休日、月間労働時間上限、必要人数など）だけでも"
-            "満たすシフトが見つかりませんでした。必要人数の設定や職員数を見直してください。"
-        ), None, []
+        # ── 自動診断: 夜勤の配置人数を最小(誰か1名)に緩めて再挑戦し、原因を切り分ける ──
+        diag_model = cp_model.CpModel()
+        diag_shift = {}
+        for s in staff_ids:
+            for d in range(n_days):
+                for code in all_codes:
+                    diag_shift[(s, d, code)] = diag_model.NewBoolVar(f"d_{s}_{d}_{code}")
+        for s in staff_ids:
+            for d in range(n_days):
+                diag_model.Add(sum(diag_shift[(s, d, code)] for code in all_codes) == 1)
+        if not use_three_shift:
+            for s in staff_ids:
+                for d in range(n_days):
+                    diag_model.Add(diag_shift[(s, d, "準")] == 0)
+        for s in staff_ids:
+            if s not in am_pm_eligible_ids:
+                for d in range(n_days):
+                    diag_model.Add(diag_shift[(s, d, "am")] == 0)
+                    diag_model.Add(diag_shift[(s, d, "pm")] == 0)
+        for _, srow in staff_df.iterrows():
+            s = srow["id"]
+            if not srow["night_shift_ok"]:
+                for d in range(n_days):
+                    diag_model.Add(diag_shift[(s, d, "入")] == 0)
+                    diag_model.Add(diag_shift[(s, d, "準")] == 0)
+        for s in staff_ids:
+            for d in range(n_days - max_consec):
+                w = [sum(diag_shift[(s, d + i, oc)] for oc in consec_break_codes) for i in range(max_consec + 1)]
+                diag_model.Add(sum(w) >= 1)
+        for s in staff_ids:
+            for d in range(n_days - 6):
+                diag_model.Add(sum(diag_shift[(s, d + i, oc)] for i in range(7) for oc in rest_codes) >= 1)
+        for _, srow in staff_df.iterrows():
+            s = srow["id"]
+            if pd.notna(srow["monthly_hour_limit"]) and srow["monthly_hour_limit"]:
+                tm = [diag_shift[(s, d, code)] * int(hours_map.get(code, 0) * 10) for d in range(n_days) for code in work_codes]
+                diag_model.Add(sum(tm) <= int(srow["monthly_hour_limit"] * 10))
+        for (s, d_index), req_code in request_map.items():
+            if req_code in special_codes:
+                diag_model.Add(diag_shift[(s, d_index, req_code)] == 1)
+        # 夜勤は「誰か1名以上いればOK」まで緩めた最小版
+        for d in range(n_days):
+            diag_model.Add(sum(diag_shift[(s, d, "入")] for s in staff_ids) >= 1)
+        diag_solver = cp_model.CpSolver()
+        diag_solver.parameters.max_time_in_seconds = min(15, time_limit_sec)
+        diag_status = diag_solver.Solve(diag_model)
+
+        if diag_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            return False, (
+                "⚠️ 原因が絞れました: 「⚙️シフト・条件設定 → 🌙夜勤の配置ルール」タブの"
+                "**標準人数（看護師○名＋介護士○名を毎日必ず確保）が厳しすぎます。**"
+                "曜日別の最低人数指定を0にしても、この夜勤の人数設定は別枠で毎日効いています。"
+                "この人数を減らすか、対応可能な夜勤スタッフを増やしてください。"
+            ), None, []
+        else:
+            return False, (
+                "絶対に守るべき条件（週1日休日、月間労働時間上限、希望・特別区分の反映など）だけでも"
+                "満たすシフトが見つかりませんでした。職員数が少なすぎるか、月間労働時間上限や"
+                "希望休みが厳しすぎる可能性があります。まずは職員を増やすか、条件を緩めてお試しください。"
+            ), None, []
 
     # 結果をDataFrameに整形（縦軸: 職員名、横軸: 日付）
     result_rows = []
