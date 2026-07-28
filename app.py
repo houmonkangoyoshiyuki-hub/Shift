@@ -1362,6 +1362,16 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
             model.Add(weekend_spread == max_wc - min_wc)
             penalty_terms.append((5, weekend_spread))
 
+    # ── ソフト⑥: 「お任せ」の日は、何もしない(×)より働く方をわずかに優先する ──
+    # 必要人数を0（お任せ）にした日でも、目的関数上「×」に一切ペナルティが無いと、
+    # ソルバーが計算上最も簡単な「ほぼ全員休み」を選んでしまうため、
+    # 個人希望が無い日については「×」に軽いペナルティを付け、通常勤務を優先させる。
+    for s in staff_ids:
+        for d in range(n_days):
+            if (s, d) in request_map:
+                continue
+            penalty_terms.append((8, shift[(s, d, "×")]))
+
     if penalty_terms:
         model.Minimize(sum(w * v for w, v in penalty_terms))
 
