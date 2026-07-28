@@ -196,7 +196,8 @@ def init_db():
             flex_nurse INTEGER NOT NULL DEFAULT 2,
             flex_care INTEGER NOT NULL DEFAULT 1,
             max_consecutive_days INTEGER NOT NULL DEFAULT 4,  -- 施設運用ルール（法律の絶対上限ではない）
-            use_three_shift INTEGER NOT NULL DEFAULT 0  -- 0=2交代制(日勤/入/明のみ) 1=3交代制(準夜勤も使う)
+            use_three_shift INTEGER NOT NULL DEFAULT 0,  -- 0=2交代制(日勤/入/明のみ) 1=3交代制(準夜勤も使う)
+            default_off_days INTEGER NOT NULL DEFAULT 10  -- 月間の公休(×)日数の基準（常勤職員に適用、変更可）
         )
     """)
     c.execute("INSERT OR IGNORE INTO night_shift_settings (id) VALUES (1)")
@@ -205,6 +206,8 @@ def init_db():
     existing_cols = [row[1] for row in c.execute("PRAGMA table_info(night_shift_settings)").fetchall()]
     if "use_three_shift" not in existing_cols:
         c.execute("ALTER TABLE night_shift_settings ADD COLUMN use_three_shift INTEGER NOT NULL DEFAULT 0")
+    if "default_off_days" not in existing_cols:
+        c.execute("ALTER TABLE night_shift_settings ADD COLUMN default_off_days INTEGER NOT NULL DEFAULT 10")
     conn.commit()
 
     # 月またぎ夜勤（前月最終日が夜勤で、当月1日への影響がある場合の入力）
@@ -1022,6 +1025,15 @@ with tabs[3]:
         )
 
         st.divider()
+        st.markdown("**🗓️ 月間の公休（×）日数の基準**")
+        st.caption(
+            "常勤職員の月間公休日数の基準です。基本は10日ですが、施設の実情に合わせて変更できます。"
+            "この日数は、できる限り必ず確保されるよう強めに扱われます。"
+        )
+        default_off = st.number_input("月間公休日数の基準", min_value=4, max_value=20,
+                                       value=int(ns[8]) if len(ns) > 8 else 10)
+
+        st.divider()
         st.markdown("**標準の夜勤配置**")
         nc1, nc2 = st.columns(2)
         with nc1:
@@ -1053,8 +1065,8 @@ with tabs[3]:
             conn = get_conn()
             conn.execute(
                 """UPDATE night_shift_settings SET standard_nurse=?, standard_care=?, allow_flex=?,
-                   flex_nurse=?, flex_care=?, max_consecutive_days=?, use_three_shift=? WHERE id=1""",
-                (std_nurse, std_care, int(allow_flex), flex_nurse, flex_care, max_consec, int(use_3shift)),
+                   flex_nurse=?, flex_care=?, max_consecutive_days=?, use_three_shift=?, default_off_days=? WHERE id=1""",
+                (std_nurse, std_care, int(allow_flex), flex_nurse, flex_care, max_consec, int(use_3shift), default_off),
             )
             conn.commit()
             conn.close()
@@ -1148,7 +1160,7 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
     if len(staff_df) == 0:
         return False, "在籍中の職員が登録されていません。", None, []
 
-    (_, std_nurse, std_care, allow_flex, flex_nurse, flex_care, max_consec, use_three_shift) = ns
+    (_, std_nurse, std_care, allow_flex, flex_nurse, flex_care, max_consec, use_three_shift, default_off_days) = ns
 
     # 前月がこのシステムで生成済みなら自動検出、無ければ手動入力（cross_month_night）で補う
     auto_cross_staff = get_auto_cross_month_night_staff(target_month)
@@ -1425,21 +1437,21 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
         model.Add(work_spread == max_wc - min_wc)
         penalty_terms.append((10, work_spread))
 
-    # ── ソフト⑧: 常勤職員には、月の実働目標日数（週1休みを引いた現実的な日数）を設定する ──
-    # ⑦（ばらつき最小化）だけだと「全員を休み気味に揃える」方向にも収束しうるため、
-    # 各人が「これくらいは働くべき」という個別の目標を明示的に持たせて底上げする。
-    min_rest_days = -(-n_days // 7)  # 週1休みの最低ライン（切り上げ）
-    target_work_days = max(0, n_days - min_rest_days - 1)  # 少し余裕を持たせた現実的な目標
+    # ── ソフト⑧: 常勤職員の月間公休(×)日数を、設定した基準（デフォルト10日）に近づける ──
+    # 完全なハード制約にすると、個人希望や特別休暇と衝突した際にシステム全体が
+    # 生成不能になるリスクがあるため、非常に高い優先度のソフト制約として扱う
+    # （実質的にはほぼ必ず守られますが、絶対的な保証ではありません）。
+    OFF_DAYS_WEIGHT = 300
     for _, srow in staff_df.iterrows():
         s = srow["id"]
         if srow["employment_type"] != "常勤":
             continue  # パート・扶養内は月間労働時間上限で別途管理済み
-        actual_work = sum(shift[(s, d, code)] for d in range(n_days) for code in work_codes)
-        diff = model.NewIntVar(-n_days, n_days, f"workdiff_{s}")
-        model.Add(diff == actual_work - target_work_days)
-        shortfall = model.NewIntVar(0, n_days, f"workshort_{s}")
-        model.Add(shortfall >= -diff)  # 目標を下回った分だけを強くペナルティ（超過は⑤の過剰配置抑制に任せる）
-        penalty_terms.append((20, shortfall))
+        actual_off = sum(shift[(s, d, "×")] for d in range(n_days))
+        diff = model.NewIntVar(-n_days, n_days, f"offdiff_{s}")
+        model.Add(diff == actual_off - default_off_days)
+        abs_diff = model.NewIntVar(0, n_days, f"offabsdiff_{s}")
+        model.AddAbsEquality(abs_diff, diff)
+        penalty_terms.append((OFF_DAYS_WEIGHT, abs_diff))
 
     if penalty_terms:
         model.Minimize(sum(w * v for w, v in penalty_terms))
