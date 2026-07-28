@@ -243,15 +243,18 @@ def init_db():
             )
         conn.commit()
 
-    # 曜日別の最低人数指定：初期値は基本0（=システムにお任せ）。
-    # 入浴日（火木土）だけ「最低限必要な理由がある」例として最小限を入れておく。
+    # 曜日別の最低人数指定：日勤(N)は毎日デフォルトで看護師2名・介護士2名を最低確保。
+    # 準夜勤・am・pmは初期値0（=システムにお任せ）。入浴日は例として日勤介護士+αを追加。
     c.execute("SELECT COUNT(*) FROM staffing_requirements")
     if c.fetchone()[0] == 0:
         for weekday in range(7):
             for shift_code in ["N", "準", "am", "pm"]:
                 for job_type in ["看護師", "介護士"]:
                     is_bath = 1 if weekday in (1, 3, 5) and shift_code == "N" else 0
-                    cnt = 1 if (is_bath and job_type == "介護士") else 0  # 入浴日の日勤介護士のみ例として最低1名
+                    if shift_code == "N":
+                        cnt = 2 + (1 if (is_bath and job_type == "介護士") else 0)  # 日勤は最低2名、入浴日の介護士は+1
+                    else:
+                        cnt = 0  # 準夜勤・am・pmはお任せ
                     c.execute(
                         "INSERT OR IGNORE INTO staffing_requirements (weekday, shift_code, job_type, required_count, is_bath_day) VALUES (?,?,?,?,?)",
                         (weekday, shift_code, job_type, cnt, is_bath),
@@ -908,6 +911,19 @@ with tabs[3]:
             "（週1休み・希望など）を守りつつ、システムが自動でバランス良く配置します。"
         )
         st.caption("「特別対応日」にチェックを入れると、入浴日など特別な日として記録に残せます（任意）。")
+
+        with st.expander("🔧 日勤(N)を全曜日「看護師2名・介護士2名」に一括設定する"):
+            st.caption("既に日勤の最低人数を0（お任せ）にしてしまった場合など、まとめて設定し直せます。")
+            if st.button("日勤(N)を全曜日 看護師2名・介護士2名 にする"):
+                conn = get_conn()
+                conn.execute(
+                    "UPDATE staffing_requirements SET required_count=2 WHERE shift_code='N' AND job_type IN ('看護師','介護士')"
+                )
+                conn.commit()
+                conn.close()
+                st.success("日勤の最低人数を、全曜日 看護師2名・介護士2名 にしました。")
+                st.rerun()
+
         conn = get_conn()
         req_df = pd.read_sql_query(
             "SELECT * FROM staffing_requirements ORDER BY weekday, shift_code, job_type", conn
