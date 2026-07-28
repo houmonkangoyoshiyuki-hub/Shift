@@ -1276,7 +1276,13 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
             else:
                 model.Add(shift[(s, d, "明")] <= requested_here + shift[(s, d - 1, "入")])
 
+    # 保険: 「明」が2日以上連続することは無い（明けは1日で終わるはずのため）
+    for s in staff_ids:
+        for d in range(n_days - 1):
+            model.Add(shift[(s, d, "明")] + shift[(s, d + 1, "明")] <= 1)
+
     # ── ハード制約⑤: 日別・シフト別の必要人数（特別対応日 > 曜日別設定の優先順位） ──
+    n_shift_excess_terms = []
     for d in range(n_days):
         weekday = date_list[d].weekday()
         d_iso = date_list[d].isoformat()
@@ -1293,7 +1299,14 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
                 ids = [i for i in (nurse_ids if job_type == "看護師" else care_ids) if i in am_pm_eligible_ids]
             else:
                 ids = nurse_ids if job_type == "看護師" else care_ids
-            model.Add(sum(shift[(s, d, code)] for s in ids) >= need)
+            headcount = sum(shift[(s, d, code)] for s in ids)
+            model.Add(headcount >= need)
+            if code == "N":
+                # 最低人数は守りつつ、それを大きく超える過剰配置には軽いペナルティを課す
+                # （偏りの調整で日によって1人〜9人、のようなバラつきを防ぐ）
+                excess = model.NewIntVar(0, len(ids), f"n_excess_{d}_{job_type}")
+                model.Add(excess >= headcount - need)
+                n_shift_excess_terms.append(excess)
 
     # ── ハード制約⑥: 夜勤人数（標準 or 柔軟対応） ──
     for d in range(n_days):
@@ -1314,6 +1327,8 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
 
     # ═══════════════ ここからソフト制約（できるだけ叶えたいルール） ═══════════════
     penalty_terms = []  # (weight, BoolVar or IntVar) のリスト
+    for term in n_shift_excess_terms:
+        penalty_terms.append((6, term))
 
     # ── ソフト①: 個人の希望（休み・有給・勤務）はできるだけ反映する。矛盾する場合は「ご相談」扱い ──
     REQUEST_WEIGHT = 1000
@@ -1391,6 +1406,8 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
     # ── ソフト⑦: 総勤務日数が特定の人に偏らないようにする（同じ職種・雇用形態のグループ内で平準化） ──
     # ⑥だけだと「誰が働くか」は決めないため、一部の人に27日、別の人はほぼ休み、という
     # 偏りが起きうる。グループ内で最大−最小の差を最小化し、まんべんなく割り振る。
+    # ただしこれだけだと「全員を低いレベルに合わせて均す」方向に流れやすいため、
+    # 常勤職員には⑧で個別の目標勤務日数も設定し、両方で挟み込んでバランスさせる。
     group_keys = staff_df.groupby(["job_type", "employment_type"]).groups.keys()
     for job_type, emp_type in group_keys:
         group_ids = staff_df[(staff_df["job_type"] == job_type) & (staff_df["employment_type"] == emp_type)]["id"].tolist()
@@ -1406,7 +1423,23 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
         model.AddMinEquality(min_wc, work_counts)
         work_spread = model.NewIntVar(0, n_days, f"work_spread_{job_type}_{emp_type}")
         model.Add(work_spread == max_wc - min_wc)
-        penalty_terms.append((25, work_spread))
+        penalty_terms.append((10, work_spread))
+
+    # ── ソフト⑧: 常勤職員には、月の実働目標日数（週1休みを引いた現実的な日数）を設定する ──
+    # ⑦（ばらつき最小化）だけだと「全員を休み気味に揃える」方向にも収束しうるため、
+    # 各人が「これくらいは働くべき」という個別の目標を明示的に持たせて底上げする。
+    min_rest_days = -(-n_days // 7)  # 週1休みの最低ライン（切り上げ）
+    target_work_days = max(0, n_days - min_rest_days - 1)  # 少し余裕を持たせた現実的な目標
+    for _, srow in staff_df.iterrows():
+        s = srow["id"]
+        if srow["employment_type"] != "常勤":
+            continue  # パート・扶養内は月間労働時間上限で別途管理済み
+        actual_work = sum(shift[(s, d, code)] for d in range(n_days) for code in work_codes)
+        diff = model.NewIntVar(-n_days, n_days, f"workdiff_{s}")
+        model.Add(diff == actual_work - target_work_days)
+        shortfall = model.NewIntVar(0, n_days, f"workshort_{s}")
+        model.Add(shortfall >= -diff)  # 目標を下回った分だけを強くペナルティ（超過は⑤の過剰配置抑制に任せる）
+        penalty_terms.append((20, shortfall))
 
     if penalty_terms:
         model.Minimize(sum(w * v for w, v in penalty_terms))
