@@ -1388,6 +1388,26 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
                 continue
             penalty_terms.append((8, shift[(s, d, "×")]))
 
+    # ── ソフト⑦: 総勤務日数が特定の人に偏らないようにする（同じ職種・雇用形態のグループ内で平準化） ──
+    # ⑥だけだと「誰が働くか」は決めないため、一部の人に27日、別の人はほぼ休み、という
+    # 偏りが起きうる。グループ内で最大−最小の差を最小化し、まんべんなく割り振る。
+    group_keys = staff_df.groupby(["job_type", "employment_type"]).groups.keys()
+    for job_type, emp_type in group_keys:
+        group_ids = staff_df[(staff_df["job_type"] == job_type) & (staff_df["employment_type"] == emp_type)]["id"].tolist()
+        if len(group_ids) < 2:
+            continue
+        work_counts = []
+        for s in group_ids:
+            wc = sum(shift[(s, d, code)] for d in range(n_days) for code in work_codes)
+            work_counts.append(wc)
+        max_wc = model.NewIntVar(0, n_days, f"max_work_{job_type}_{emp_type}")
+        min_wc = model.NewIntVar(0, n_days, f"min_work_{job_type}_{emp_type}")
+        model.AddMaxEquality(max_wc, work_counts)
+        model.AddMinEquality(min_wc, work_counts)
+        work_spread = model.NewIntVar(0, n_days, f"work_spread_{job_type}_{emp_type}")
+        model.Add(work_spread == max_wc - min_wc)
+        penalty_terms.append((25, work_spread))
+
     if penalty_terms:
         model.Minimize(sum(w * v for w, v in penalty_terms))
 
