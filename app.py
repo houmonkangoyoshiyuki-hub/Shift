@@ -87,7 +87,7 @@ def init_db():
             monthly_hour_limit INTEGER,       -- パート等の月間労働時間上限（常勤はNULL）
             night_shift_ok INTEGER NOT NULL DEFAULT 1,  -- 1=可, 0=不可
             night_shift_target INTEGER DEFAULT 4,       -- 月間目標夜勤回数
-            am_pm_eligible INTEGER NOT NULL DEFAULT 0,  -- 午前(am)/午後(pm)勤務に対応できるか（1=可）
+            am_pm_eligible INTEGER NOT NULL DEFAULT 1,  -- 午前(am)/午後(pm)勤務に対応できるか（1=可、基本は可でOK。不可の人だけ個別にチェックを外す）
             hire_date TEXT NOT NULL,          -- 入社年月日 YYYY-MM-DD
             active INTEGER NOT NULL DEFAULT 1,
             note TEXT
@@ -97,7 +97,14 @@ def init_db():
     # 簡易マイグレーション: 旧バージョンのDBにam_pm_eligibleが無い場合は追加
     existing_staff_cols = [row[1] for row in c.execute("PRAGMA table_info(staff)").fetchall()]
     if "am_pm_eligible" not in existing_staff_cols:
-        c.execute("ALTER TABLE staff ADD COLUMN am_pm_eligible INTEGER NOT NULL DEFAULT 0")
+        c.execute("ALTER TABLE staff ADD COLUMN am_pm_eligible INTEGER NOT NULL DEFAULT 1")
+    else:
+        # 以前のバージョンでデフォルト0のまま登録されたデータを救済（誰か1人でも
+        # 意図的に1にしていたら、その調整は尊重してスキップする）
+        total = c.execute("SELECT COUNT(*) FROM staff").fetchone()[0]
+        eligible_count = c.execute("SELECT COUNT(*) FROM staff WHERE am_pm_eligible=1").fetchone()[0]
+        if total > 0 and eligible_count == 0:
+            c.execute("UPDATE staff SET am_pm_eligible=1")
     conn.commit()
 
     # 職員ごとのシフト制約（希望休み・希望勤務・時間縛り等）月単位で管理
@@ -1117,6 +1124,11 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
 
     (_, std_nurse, std_care, allow_flex, flex_nurse, flex_care, max_consec, use_three_shift) = ns
 
+    # 前月がこのシステムで生成済みなら自動検出、無ければ手動入力（cross_month_night）で補う
+    auto_cross_staff = get_auto_cross_month_night_staff(target_month)
+    manual_cross_staff = {int(crow["staff_id"]) for _, crow in cross_df.iterrows()}
+    all_cross_staff = auto_cross_staff | manual_cross_staff
+
     work_codes = ["N", "準", "入", "am", "pm"]         # 必要人数の対象になる通常勤務
     special_codes = list(SPECIAL_CODES)                 # 出/実/研/産/育（希望があれば100%反映、必要人数の対象外）
     leave_codes = list(LEAVE_CODES)                      # 年/年am/年pm
@@ -1226,6 +1238,18 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
                 if code != req_here:
                     model.Add(shift[(s, d, code)] == 0)
 
+    # 「明」は、①本人が明示的に希望した日、②前日が「入」だった日、③前月末が夜勤入りで
+    # 月をまたいだ1日目、のいずれかでなければ割り当てない（無関係な日に「明」が
+    # 勝手に連発するのを防ぐ）
+    for s in staff_ids:
+        for d in range(n_days):
+            requested_here = 1 if request_map.get((s, d)) == "明" else 0
+            if d == 0:
+                cross_ok = 1 if s in all_cross_staff else 0
+                model.Add(shift[(s, d, "明")] <= requested_here + cross_ok)
+            else:
+                model.Add(shift[(s, d, "明")] <= requested_here + shift[(s, d - 1, "入")])
+
     # ── ハード制約⑤: 日別・シフト別の必要人数（特別対応日 > 曜日別設定の優先順位） ──
     for d in range(n_days):
         weekday = date_list[d].weekday()
@@ -1290,10 +1314,6 @@ def build_and_solve_schedule(target_month: str, time_limit_sec: int = 30):
             penalty_terms.append((NIGHT_REST_WEIGHT, aux))
 
     # ── ソフト③: 月またぎ夜勤の翌日も明けを強く推奨（絶対ではない） ──
-    # 前月がこのシステムで生成済みなら自動検出、無ければ手動入力（cross_month_night）で補う
-    auto_cross_staff = get_auto_cross_month_night_staff(target_month)
-    manual_cross_staff = {int(crow["staff_id"]) for _, crow in cross_df.iterrows()}
-    all_cross_staff = auto_cross_staff | manual_cross_staff
     for s in all_cross_staff:
         if s not in staff_ids or (s, 0) in request_map:
             continue
