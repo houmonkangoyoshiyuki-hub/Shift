@@ -430,7 +430,7 @@ with tabs[0]:
                     f_limit = st.number_input("月間労働時間上限（時間）", min_value=1, max_value=200, value=80)
                 f_night_ok = st.checkbox("夜勤可能", value=True)
                 f_night_target = st.number_input("月間目標夜勤回数", min_value=0, max_value=15, value=4)
-                f_am_pm = st.checkbox("午前(am)・午後(pm)勤務に対応できる", value=False,
+                f_am_pm = st.checkbox("午前(am)・午後(pm)勤務に対応できる", value=True,
                                        help="チェックを入れた職員だけが、自動生成でam/pm勤務の必要人数の対象になります。")
                 f_note = st.text_input("備考（任意）")
 
@@ -454,6 +454,16 @@ with tabs[0]:
 
     st.divider()
     st.subheader("📋 職員一覧")
+
+    with st.expander("🔧 全員まとめて「午前(am)/午後(pm)対応可」にする（うまく反映されない場合はこちら）"):
+        st.caption("個別に不可の人がいる場合は、下の一覧からその人だけチェックを外してください。")
+        if st.button("全員を「対応可」に一括設定する"):
+            conn = get_conn()
+            conn.execute("UPDATE staff SET am_pm_eligible=1")
+            conn.commit()
+            conn.close()
+            st.success("全員を「対応可」にしました。")
+            st.rerun()
 
     col_a, col_b, col_c = st.columns(3)
     with col_a:
